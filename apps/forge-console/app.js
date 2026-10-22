@@ -1,34 +1,42 @@
 import { t } from './i18n.js';
 import { mountStudioWorkbench, WORKBENCH_INTENT_ID } from './workbench.js';
 
-/** Product shell: validation studio first; Intent OS loop as secondary “闭环”. */
+/**
+ * P1 product shell — projects + my-tasks primary; Intent OS under 闭环.
+ * No top-level task space. Validate tab deep-links into studio workbench.
+ */
 const NAV_GROUPS = [
   {
-    id: 'studio',
-    labelKey: 'navGroupStudio',
-    items: [['studio', 'navStudio']],
+    id: 'primary',
+    labelKey: 'navGroupPrimary',
+    items: [
+      ['projects', 'navProjects'],
+      ['mytasks', 'navMyTasks'],
+    ],
   },
   {
     id: 'loop',
     labelKey: 'navGroupLoop',
     items: [
-      ['tree', 'navTree'],
       ['workbench', 'navWorkbenchLegacy'],
-      ['create', 'navCreate'],
-      ['collab', 'navCollab'],
-      ['tasks', 'navTasks'],
+      ['tree', 'navTree'],
       ['deploy', 'navDeploy'],
-      ['discover', 'navDiscover'],
-      ['spaces', 'navSpaces'],
-      ['market', 'navMarket'],
       ['equity', 'navEquity'],
       ['governance', 'navGovernance'],
-      ['history', 'navHistory'],
-      ['overview', 'navOverview'],
       ['account', 'navAccount'],
       ['connections', 'navConnections'],
+      ['history', 'navHistory'],
+      ['overview', 'navOverview'],
     ],
   },
+];
+
+const PROJECT_TABS = [
+  ['overview', 'projectTabOverview'],
+  ['intent', 'projectTabIntent'],
+  ['validate', 'projectTabValidate'],
+  ['evidence', 'projectTabEvidence'],
+  ['assets', 'projectTabAssets'],
 ];
 
 let studioMount = null;
@@ -74,12 +82,22 @@ const SCENARIO_SEED_TITLES = {
   },
 };
 
+function migrateShellPage(raw) {
+  if (!raw || raw === 'studio' || raw === 'tasks') return 'projects';
+  return raw;
+}
+
 const state = {
   locale: localStorage.getItem('forge.locale') || 'zh',
-  page: localStorage.getItem('forge.page') || 'studio',
+  page: migrateShellPage(localStorage.getItem('forge.page')),
   tenantId: localStorage.getItem('forge.tenant') || 'tenant.demo',
   actorId: localStorage.getItem('forge.actor') || 'user.demo',
   scenarioMode: localStorage.getItem('forge.scenario') || 'PRODUCT',
+  projects: [],
+  myTasks: [],
+  selectedProjectId: localStorage.getItem('forge.projectId') || WORKBENCH_INTENT_ID,
+  projectTab: localStorage.getItem('forge.projectTab') || 'validate',
+  projectWorkbench: null,
   account: null,
   intents: [],
   adapters: [],
@@ -1256,7 +1274,7 @@ function renderTasks() {
       } catch (error) { toast(error.message); }
     });
   });
-  el('tasks-to-studio')?.addEventListener('click', () => navigate('studio'));
+  el('tasks-to-studio')?.addEventListener('click', () => openProject(state.selectedProjectId || WORKBENCH_INTENT_ID, 'validate'));
 }
 
 function renderSpaceColumn(title, assets, spaceKey) {
@@ -2109,12 +2127,223 @@ function renderHistory() {
   });
 }
 
-async function renderStudio() {
-  // Studio speaks via workbench chrome — no instructional page sub.
-  setHeader('', tt('studioTitle'), '');
+async function refreshProjects() {
+  try {
+    const ensured = await api('POST', '/v1/forge/projects/ensure-demo', {
+      body: { lang: state.locale === 'en' ? 'en' : 'zh' },
+      idempotencyKey: `proj-ensure:${state.actorId}`,
+    });
+    state.projects = ensured.projects || [];
+  } catch (err) {
+    try {
+      const listed = await api('GET', `/v1/forge/projects?locale=${state.locale === 'en' ? 'en' : 'zh'}`);
+      state.projects = listed.projects || [];
+    } catch (e2) {
+      toast(e2.message || err.message);
+      state.projects = [];
+    }
+  }
+  if (!state.projects.some((p) => p.id === state.selectedProjectId) && state.projects[0]) {
+    state.selectedProjectId = state.projects[0].id;
+    localStorage.setItem('forge.projectId', state.selectedProjectId);
+  }
+}
+
+async function refreshMyTasks() {
+  try {
+    const res = await api('GET', `/v1/forge/my-tasks?locale=${state.locale === 'en' ? 'en' : 'zh'}`);
+    state.myTasks = res.tasks || [];
+  } catch (err) {
+    toast(err.message);
+    state.myTasks = [];
+  }
+}
+
+function selectedProject() {
+  return state.projects.find((p) => p.id === state.selectedProjectId) || state.projects[0] || null;
+}
+
+function setProjectTab(tab) {
+  state.projectTab = tab;
+  localStorage.setItem('forge.projectTab', tab);
+}
+
+function openProject(projectId, tab = 'validate') {
+  state.selectedProjectId = projectId;
+  localStorage.setItem('forge.projectId', projectId);
+  state.selectedIntentId = projectId;
+  localStorage.setItem('forge.intent', projectId);
+  setProjectTab(tab);
+  state.page = 'project';
+  localStorage.setItem('forge.page', 'project');
+  document.body.classList.toggle('studio-mode', tab === 'validate');
+  applyChromeI18n();
+  renderPage();
+}
+
+function projectSwitcherHtml() {
+  const current = selectedProject();
+  return `
+    <div class="project-switch">
+      <select id="project-switcher" aria-label="${tt('navProjects')}">
+        ${state.projects.map((p) => `
+          <option value="${escapeAttr(p.id)}" ${p.id === current?.id ? 'selected' : ''}>
+            ${escapeAttr(p.name)}
+          </option>`).join('')}
+      </select>
+      <nav class="shell-tabs" aria-label="${tt('projectTabs')}">
+        ${PROJECT_TABS.map(([id, key]) => `
+          <button type="button" class="shell-tab${state.projectTab === id ? ' active' : ''}" data-ptab="${id}">
+            ${tt(key)}
+          </button>`).join('')}
+      </nav>
+    </div>`;
+}
+
+function bindProjectChrome() {
+  el('project-switcher')?.addEventListener('change', (e) => {
+    openProject(e.target.value, state.projectTab);
+  });
+  el('content').querySelectorAll('[data-ptab]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      setProjectTab(btn.dataset.ptab);
+      document.body.classList.toggle('studio-mode', state.projectTab === 'validate');
+      renderPage();
+    });
+  });
+}
+
+async function loadProjectWorkbench(projectId) {
+  try {
+    const view = await api('GET', `/v1/forge/intents/${encodeURIComponent(projectId)}/workbench`);
+    state.projectWorkbench = view.state || null;
+  } catch {
+    state.projectWorkbench = null;
+  }
+}
+
+function renderProjects() {
+  document.body.classList.remove('studio-mode');
+  setHeader('', tt('navProjects'), '');
+  const rows = state.projects.length
+    ? state.projects.map((p) => `
+      <button type="button" class="project-row" data-open-project="${escapeAttr(p.id)}">
+        <span class="project-row-name">${escapeAttr(p.name)}</span>
+        <span class="project-row-meta">${escapeAttr(p.scenario)} · ${escapeAttr(p.status)}</span>
+        <span class="project-row-go">→</span>
+      </button>`).join('')
+    : `<p class="empty">${tt('projectsEmpty')}</p>`;
+  el('content').innerHTML = `<div class="project-list">${rows}</div>`;
+  el('content').querySelectorAll('[data-open-project]').forEach((btn) => {
+    btn.addEventListener('click', () => openProject(btn.dataset.openProject, 'validate'));
+  });
+}
+
+function renderMyTasksPage() {
+  document.body.classList.remove('studio-mode');
+  setHeader('', tt('navMyTasks'), '');
+  const rows = state.myTasks.length
+    ? state.myTasks.map((row) => `
+      <button type="button" class="task-view-row" data-goto-project="${escapeAttr(row.projectId)}">
+        <span class="task-view-title">${escapeAttr(row.task.title)}</span>
+        <span class="task-view-project">${escapeAttr(row.projectName)}</span>
+        <span class="badge">${escapeAttr(row.task.status)}</span>
+      </button>`).join('')
+    : `<p class="empty">${tt('myTasksEmpty')}</p>`;
+  el('content').innerHTML = `<div class="task-view-list">${rows}</div>`;
+  el('content').querySelectorAll('[data-goto-project]').forEach((btn) => {
+    btn.addEventListener('click', () => openProject(btn.dataset.gotoProject, 'validate'));
+  });
+}
+
+function renderProjectOverview() {
+  const p = selectedProject();
+  const wb = state.projectWorkbench;
+  const budget = wb?.budget;
+  el('content').innerHTML = `
+    ${projectSwitcherHtml()}
+    <div class="project-panel">
+      <h2 class="project-heading">${escapeAttr(p?.name || '—')}</h2>
+      <div class="project-meta-row">
+        <span class="badge">${escapeAttr(p?.status || '—')}</span>
+        <span class="stat-sub">${escapeAttr(p?.scenario || '')}</span>
+      </div>
+      ${budget ? `
+        <div class="project-stats">
+          <div><span class="stat-sub">${tt('projectBudget')}</span><strong>¥${budget.total}</strong></div>
+          <div><span class="stat-sub">${tt('projectSpent')}</span><strong>¥${budget.spent}</strong></div>
+          <div><span class="stat-sub">${tt('projectReserved')}</span><strong>¥${budget.reserved}</strong></div>
+        </div>` : ''}
+      <div class="btn-row" style="margin-top:1.25rem">
+        <button type="button" class="btn btn-cyan" id="goto-validate">${tt('projectTabValidate')}</button>
+      </div>
+    </div>`;
+  bindProjectChrome();
+  el('goto-validate')?.addEventListener('click', () => {
+    setProjectTab('validate');
+    document.body.classList.add('studio-mode');
+    renderPage();
+  });
+}
+
+function renderProjectEvidence() {
+  const wb = state.projectWorkbench;
+  const tests = wb?.tests?.results || [];
+  const payable = wb?.payable;
+  const feedback = wb?.comment;
+  el('content').innerHTML = `
+    ${projectSwitcherHtml()}
+    <div class="project-panel evidence-grid">
+      <section>
+        <h3>${tt('evidenceChecks')}</h3>
+        ${tests.length ? tests.map((t) => `
+          <div class="list-row">
+            <span>${escapeAttr(t.id)}</span>
+            <span class="badge ${t.pass ? 'ok' : 'warn'}">${t.pass ? '✓' : '×'}</span>
+            <span>¥${t.actual ?? '—'} / ¥${t.expected}</span>
+          </div>`).join('') : `<p class="empty">${tt('evidenceEmpty')}</p>`}
+      </section>
+      <section>
+        <h3>${tt('evidenceFeedback')}</h3>
+        ${feedback ? `<div class="list-row"><div>${escapeAttr(feedback.text)}</div><span class="badge">${escapeAttr(feedback.status)}</span></div>`
+          : `<p class="empty">${tt('evidenceEmpty')}</p>`}
+      </section>
+      <section>
+        <h3>${tt('evidencePayable')}</h3>
+        ${payable ? `<div class="list-row"><strong>¥${payable.amount}</strong><span class="badge warn">${escapeAttr(payable.status)}</span></div>`
+          : `<p class="empty">${tt('evidenceEmpty')}</p>`}
+      </section>
+    </div>`;
+  bindProjectChrome();
+}
+
+function renderProjectAssets() {
+  const asset = state.projectWorkbench?.asset;
+  el('content').innerHTML = `
+    ${projectSwitcherHtml()}
+    <div class="project-panel">
+      <h3>${tt('projectTabAssets')}</h3>
+      ${asset ? `
+        <div class="list-row">
+          <div>
+            <div>${escapeAttr(String(asset.id || 'asset'))}</div>
+            <div class="stat-sub">v${escapeAttr(String(asset.version ?? ''))} · ${escapeAttr(String(asset.rights || asset.license || ''))}</div>
+          </div>
+          <span class="badge">${tt('assetRegistered')}</span>
+        </div>` : `<p class="empty">${tt('assetsEmpty')}</p>`}
+    </div>`;
+  bindProjectChrome();
+}
+
+async function renderProjectValidate() {
+  const p = selectedProject();
+  const intentId = p?.id || WORKBENCH_INTENT_ID;
+  setHeader('', p?.name || tt('projectTabValidate'), '');
   document.body.classList.add('studio-mode');
-  const content = el('content');
-  content.innerHTML = `<div class="studio-host" id="studio-host"></div>`;
+  el('content').innerHTML = `
+    ${projectSwitcherHtml()}
+    <div class="studio-host" id="studio-host"></div>`;
+  bindProjectChrome();
   if (studioMount) {
     studioMount.destroy();
     studioMount = null;
@@ -2129,14 +2358,17 @@ async function renderStudio() {
   };
   try {
     studioMount = await mountStudioWorkbench(host, {
-      intentId: WORKBENCH_INTENT_ID,
+      intentId,
       lang: state.locale === 'en' ? 'en' : 'zh',
       api: wbApi,
       headers: () => headers({}),
       ensure: async () => {
         await api('POST', '/v1/forge/workbench/ensure', {
-          body: { lang: state.locale === 'en' ? 'en' : 'zh' },
-          idempotencyKey: `wb-ensure:${state.actorId}`,
+          body: {
+            intent_id: intentId,
+            lang: state.locale === 'en' ? 'en' : 'zh',
+          },
+          idempotencyKey: `wb-ensure:${intentId}:${state.actorId}`,
         });
       },
       onLang: (lang) => {
@@ -2152,27 +2384,86 @@ async function renderStudio() {
   }
 }
 
+async function renderProjectPage() {
+  await refreshProjects();
+  const p = selectedProject();
+  if (!p) {
+    state.page = 'projects';
+    renderProjects();
+    return;
+  }
+  if (state.projectTab !== 'validate' && state.projectTab !== 'intent') {
+    await loadProjectWorkbench(p.id);
+  }
+  if (state.projectTab === 'overview') renderProjectOverview();
+  else if (state.projectTab === 'intent') await renderProjectIntentScoped();
+  else if (state.projectTab === 'evidence') renderProjectEvidence();
+  else if (state.projectTab === 'assets') renderProjectAssets();
+  else await renderProjectValidate();
+}
+
+async function renderProjectIntentScoped() {
+  const p = selectedProject();
+  state.selectedIntentId = p?.id || null;
+  if (p) {
+    await refreshIntentTree(p.id);
+    await refreshIntents();
+  }
+  setHeader('', p?.name || tt('projectTabIntent'), '');
+  document.body.classList.remove('studio-mode');
+  // Build chrome + tree in one pass
+  const tree = state.intentTree || p && state.intents.find((i) => i.id === p.id)?.intentTree;
+  const nodes = tree?.nodes || [];
+  el('content').innerHTML = `
+    ${projectSwitcherHtml()}
+    <div class="project-panel">
+      <div class="tree-workspace">
+        <div class="tree-canvas">
+          ${nodes.length ? nodes.map((n) => `
+            <button type="button" class="tree-node ${state.selectedTreeNodeId === n.id ? 'active' : ''}" data-node="${escapeAttr(n.id)}">
+              <span class="badge">${escapeAttr(n.kind)}</span> ${escapeAttr(n.title)}
+            </button>`).join('') : `<p class="empty">${tt('treeEmpty')}</p>`}
+        </div>
+      </div>
+    </div>`;
+  bindProjectChrome();
+  el('content').querySelectorAll('[data-node]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.selectedTreeNodeId = btn.dataset.node;
+      renderProjectIntentScoped();
+    });
+  });
+}
+
 function renderPage() {
   const map = {
     overview: renderOverview,
-    studio: () => { void renderStudio(); },
+    projects: () => { void refreshProjects().then(() => renderProjects()); },
+    project: () => { void renderProjectPage(); },
+    mytasks: () => { void refreshMyTasks().then(() => renderMyTasksPage()); },
     tree: renderTree,
     workbench: renderWorkbench,
-    collab: renderCollab,
-    tasks: renderTasks,
-    spaces: renderSpaces,
-    discover: renderDiscover,
-    create: renderCreate,
     deploy: renderDeploy,
-    market: renderMarket,
     account: renderAccount,
     connections: renderConnections,
     governance: renderGovernance,
     equity: renderEquity,
     history: renderHistory,
   };
+  if (state.page === 'projects') {
+    void refreshProjects().then(() => renderProjects());
+    return;
+  }
+  if (state.page === 'project') {
+    void renderProjectPage();
+    return;
+  }
+  if (state.page === 'mytasks') {
+    void refreshMyTasks().then(() => renderMyTasksPage());
+    return;
+  }
   if (state.page === 'studio') {
-    void renderStudio();
+    openProject(state.selectedProjectId || WORKBENCH_INTENT_ID, 'validate');
     return;
   }
   if (state.page === 'workbench') {
@@ -2193,20 +2484,9 @@ function renderPage() {
     return;
   }
   if (state.page === 'tasks') {
-    void (async () => {
-      const intent = selectedIntent();
-      if (intent) {
-        await refreshIntentTree(intent.id);
-        await refreshTasks(intent.id);
-      } else {
-        state.tasks = [];
-      }
-      renderTasks();
-    })();
-    return;
-  }
-  if (state.page === 'spaces') {
-    void refreshSpaces().then(() => renderSpaces());
+    state.page = 'mytasks';
+    localStorage.setItem('forge.page', 'mytasks');
+    void refreshMyTasks().then(() => renderMyTasksPage());
     return;
   }
   if (state.page === 'history') {
@@ -2229,7 +2509,7 @@ function renderPage() {
     void refreshLifeforms().then(() => renderDeploy());
     return;
   }
-  (map[state.page] || (() => { void renderStudio(); }))();
+  (map[state.page] || (() => { void refreshProjects().then(() => renderProjects()); }))();
 }
 
 el('lang-zh').addEventListener('click', () => {

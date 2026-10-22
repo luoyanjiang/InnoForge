@@ -126,6 +126,12 @@ import {
   type WorkbenchPersistence,
   type WorkbenchView,
 } from './forge-workbench-ops.js';
+import {
+  DEMO_PROJECT_SPECS,
+  toProjectDto,
+  type ForgeMyTaskDto,
+  type ForgeProjectDto,
+} from './forge-projects.js';
 
 type JudgmentRow = {
   id: string;
@@ -2010,6 +2016,94 @@ export class PostgresForgeLoopService implements ForgeLoopService {
     tenantId: string;
   }): Promise<{ filename: string; buffer: Buffer }> {
     return deliveryZipWorkbench(this.workbenchStore(), input);
+  }
+
+  async listProjects(input: {
+    tenantId: string;
+    locale?: 'zh' | 'en';
+  }): Promise<readonly ForgeProjectDto[]> {
+    const locale = input.locale ?? 'zh';
+    const intents = await this.listIntents({ tenantId: input.tenantId });
+    const projects: ForgeProjectDto[] = [];
+    for (const intent of intents) {
+      const wb = await this.workbenchStore().load(intent.id, input.tenantId);
+      projects.push(toProjectDto({
+        intent,
+        workbench: wb?.state ?? null,
+        locale,
+      }));
+    }
+    return Object.freeze(projects);
+  }
+
+  async ensureDemoProjects(input: {
+    audit: ForgeAudit;
+    locale?: 'zh' | 'en';
+  }): Promise<readonly ForgeProjectDto[]> {
+    await this.ensureAccount({
+      tenantId: input.audit.tenantId,
+      principalId: input.audit.actorId,
+      openingBalance: 5000,
+    });
+    for (const spec of DEMO_PROJECT_SPECS) {
+      try {
+        await this.requireIntent(spec.id, input.audit.tenantId);
+      } catch {
+        await this.createIntent({
+          id: spec.id,
+          statement: spec.statement,
+          stake: 40,
+          constraints: [{ key: 'demo', op: '=', value: 'project', unit: 'flag' }],
+          scenario: 'PRODUCT',
+          audit: {
+            ...input.audit,
+            idempotencyKey: `${input.audit.idempotencyKey}:${spec.id}`,
+          },
+        });
+      }
+    }
+    await ensureWorkbench(this.workbenchStore(), {
+      intentId: WORKBENCH_DEMO_INTENT_ID,
+      lang: input.locale ?? 'zh',
+      audit: {
+        ...input.audit,
+        idempotencyKey: `${input.audit.idempotencyKey}:wb-lightboat`,
+      },
+    });
+    return this.listProjects({
+      tenantId: input.audit.tenantId,
+      ...(input.locale ? { locale: input.locale } : {}),
+    });
+  }
+
+  async listMyTasks(input: {
+    tenantId: string;
+    actorId: string;
+    locale?: 'zh' | 'en';
+  }): Promise<readonly ForgeMyTaskDto[]> {
+    const locale = input.locale ?? 'zh';
+    const projects = await this.listProjects({
+      tenantId: input.tenantId,
+      locale,
+    });
+    const out: ForgeMyTaskDto[] = [];
+    for (const project of projects) {
+      const tasks = await this.listTasks({
+        intentId: project.id,
+        tenantId: input.tenantId,
+      });
+      for (const task of tasks) {
+        void input.actorId;
+        out.push(Object.freeze({
+          task,
+          projectId: project.id,
+          projectName: project.name,
+        }));
+      }
+    }
+    return Object.freeze(
+      out.sort((a, b) => b.task.updatedAt.localeCompare(a.task.updatedAt)),
+    );
   }
 
   async getIntentTree(input: {
