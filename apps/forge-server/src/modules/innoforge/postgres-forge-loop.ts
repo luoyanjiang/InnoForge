@@ -65,6 +65,13 @@ import {
   type ForgeLifeformProposal,
   type ForgeLifeformStatus,
 } from './forge-lifeforms.js';
+import {
+  constraintFromMemory,
+  freezeMemory,
+  newMemoryId,
+  type ForgeMemory,
+  type ForgeMemoryStatus,
+} from './forge-memories.js';
 
 type JudgmentRow = {
   id: string;
@@ -1224,6 +1231,218 @@ export class PostgresForgeLoopService implements ForgeLoopService {
       client.release();
     }
     return next;
+  }
+
+  private memoryFromRow(row: {
+    id: string;
+    intent_id: string;
+    tenant_id: string;
+    text: string;
+    status: ForgeMemoryStatus;
+    consensus: boolean;
+    promoted_constraint: ForgeConstraint | null;
+    created_at: Date;
+    updated_at: Date;
+    created_by: string;
+    forgotten_at: Date | null;
+    promoted_at: Date | null;
+  }): ForgeMemory {
+    return freezeMemory({
+      id: row.id,
+      intentId: row.intent_id,
+      tenantId: row.tenant_id,
+      text: row.text,
+      status: row.status,
+      consensus: Boolean(row.consensus),
+      ...(row.promoted_constraint
+        ? { promotedConstraint: immutableJsonCopy(row.promoted_constraint) }
+        : {}),
+      createdAt: new Date(row.created_at).toISOString(),
+      updatedAt: new Date(row.updated_at).toISOString(),
+      createdBy: row.created_by,
+      ...(row.forgotten_at ? { forgottenAt: new Date(row.forgotten_at).toISOString() } : {}),
+      ...(row.promoted_at ? { promotedAt: new Date(row.promoted_at).toISOString() } : {}),
+    });
+  }
+
+  async createMemory(input: {
+    intentId: string;
+    text: string;
+    audit: ForgeAudit;
+  }): Promise<ForgeMemory> {
+    await this.requireIntent(input.intentId, input.audit.tenantId);
+    const text = input.text.trim();
+    if (!text) throw new ForgeLoopError('MEMORY_TEXT_REQUIRED');
+    const id = newMemoryId();
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `INSERT INTO forge_memories
+          (id, intent_id, tenant_id, text, status, consensus, created_at, updated_at, created_by)
+         VALUES ($1,$2,$3,$4,'ACTIVE',false,$5::timestamptz,$5::timestamptz,$6)`,
+        [
+          id,
+          input.intentId,
+          input.audit.tenantId,
+          text,
+          input.audit.occurredAt,
+          input.audit.actorId,
+        ],
+      );
+      const payload = { memoryId: id, text };
+      await this.insertEvent(client, input.intentId, 'forge.memory.created', input.audit, payload);
+      await this.appendDomainEvent(client, input.intentId, 'forge.memory.created', input.audit, payload);
+      await client.query(
+        `UPDATE forge_intents SET updated_at=$2::timestamptz WHERE id=$1`,
+        [input.intentId, input.audit.occurredAt],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    const created = await this.pool.query(`SELECT * FROM forge_memories WHERE id=$1`, [id]);
+    if (!created.rows[0]) throw new ForgeLoopError('MEMORY_NOT_FOUND');
+    return this.memoryFromRow(created.rows[0]);
+  }
+
+  async listMemories(input: {
+    intentId: string;
+    tenantId: string;
+    includeForgotten?: boolean;
+  }): Promise<readonly ForgeMemory[]> {
+    await this.requireIntent(input.intentId, input.tenantId);
+    const result = await this.pool.query(
+      input.includeForgotten
+        ? `SELECT * FROM forge_memories
+            WHERE intent_id=$1 AND tenant_id=$2
+            ORDER BY updated_at DESC, id`
+        : `SELECT * FROM forge_memories
+            WHERE intent_id=$1 AND tenant_id=$2 AND status <> 'FORGOTTEN'
+            ORDER BY updated_at DESC, id`,
+      [input.intentId, input.tenantId],
+    );
+    return Object.freeze(result.rows.map((row) => this.memoryFromRow(row)));
+  }
+
+  async getMemory(input: {
+    intentId: string;
+    memoryId: string;
+    tenantId: string;
+  }): Promise<ForgeMemory | undefined> {
+    const result = await this.pool.query(
+      `SELECT * FROM forge_memories WHERE id=$1 AND intent_id=$2 AND tenant_id=$3`,
+      [input.memoryId, input.intentId, input.tenantId],
+    );
+    if (!result.rows[0]) return undefined;
+    return this.memoryFromRow(result.rows[0]);
+  }
+
+  async forgetMemory(input: {
+    intentId: string;
+    memoryId: string;
+    audit: ForgeAudit;
+  }): Promise<ForgeMemory> {
+    const memory = await this.getMemory({
+      intentId: input.intentId,
+      memoryId: input.memoryId,
+      tenantId: input.audit.tenantId,
+    });
+    if (!memory) throw new ForgeLoopError('MEMORY_NOT_FOUND');
+    if (memory.status === 'FORGOTTEN') return memory;
+    if (memory.status === 'PROMOTED') throw new ForgeLoopError('MEMORY_ALREADY_PROMOTED');
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE forge_memories
+            SET status='FORGOTTEN', forgotten_at=$2::timestamptz, updated_at=$2::timestamptz
+          WHERE id=$1`,
+        [memory.id, input.audit.occurredAt],
+      );
+      const payload = { memoryId: memory.id };
+      await this.insertEvent(client, input.intentId, 'forge.memory.forgotten', input.audit, payload);
+      await this.appendDomainEvent(client, input.intentId, 'forge.memory.forgotten', input.audit, payload);
+      await client.query(
+        `UPDATE forge_intents SET updated_at=$2::timestamptz WHERE id=$1`,
+        [input.intentId, input.audit.occurredAt],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    const next = await this.getMemory({
+      intentId: input.intentId,
+      memoryId: input.memoryId,
+      tenantId: input.audit.tenantId,
+    });
+    if (!next) throw new ForgeLoopError('MEMORY_NOT_FOUND');
+    return next;
+  }
+
+  async promoteMemory(input: {
+    intentId: string;
+    memoryId: string;
+    audit: ForgeAudit;
+  }): Promise<{ memory: ForgeMemory; intent: ForgeIntent }> {
+    const intent = await this.requireIntent(input.intentId, input.audit.tenantId);
+    const memory = await this.getMemory({
+      intentId: input.intentId,
+      memoryId: input.memoryId,
+      tenantId: input.audit.tenantId,
+    });
+    if (!memory) throw new ForgeLoopError('MEMORY_NOT_FOUND');
+    if (memory.status === 'FORGOTTEN') throw new ForgeLoopError('MEMORY_FORGOTTEN');
+    if (memory.status === 'PROMOTED') return { memory, intent };
+    if (intent.frozen) throw new ForgeLoopError('INTENT_FROZEN');
+    const promotedConstraint = constraintFromMemory(memory.text);
+    const nextConstraints = [...intent.constraints, promotedConstraint];
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE forge_memories
+            SET status='PROMOTED', consensus=true, promoted_constraint=$2::jsonb,
+                promoted_at=$3::timestamptz, updated_at=$3::timestamptz
+          WHERE id=$1`,
+        [memory.id, JSON.stringify(promotedConstraint), input.audit.occurredAt],
+      );
+      await client.query(
+        `UPDATE forge_intents
+            SET constraints=$2::jsonb, updated_at=$3::timestamptz
+          WHERE id=$1`,
+        [input.intentId, JSON.stringify(nextConstraints), input.audit.occurredAt],
+      );
+      const payload = {
+        memoryId: memory.id,
+        constraint: promotedConstraint,
+        consensus: true,
+      };
+      await this.insertEvent(client, input.intentId, 'forge.memory.promoted', input.audit, payload);
+      await this.appendDomainEvent(client, input.intentId, 'forge.memory.promoted', input.audit, payload);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    const nextMemory = await this.getMemory({
+      intentId: input.intentId,
+      memoryId: input.memoryId,
+      tenantId: input.audit.tenantId,
+    });
+    if (!nextMemory) throw new ForgeLoopError('MEMORY_NOT_FOUND');
+    return {
+      memory: nextMemory,
+      intent: await this.requireIntent(input.intentId, input.audit.tenantId),
+    };
   }
 
   private async requireIntent(id: string, tenantId: string): Promise<ForgeIntent> {

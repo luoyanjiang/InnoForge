@@ -51,6 +51,13 @@ import {
   type ForgeLifeformProposal,
   type ForgeLifeformStatus,
 } from './forge-lifeforms.js';
+import {
+  constraintFromMemory,
+  freezeMemory,
+  newMemoryId,
+  type ForgeMemory,
+  type ForgeMemoryStatus,
+} from './forge-memories.js';
 
 export type { ForgeConstraint } from './forge-constraints.js';
 export type { ForgeJudgment, ForgeJudgmentAction, ForgeVariantCandidate } from './forge-judgments.js';
@@ -70,6 +77,7 @@ export type {
   ForgeLifeformProposalStatus,
   ForgeLifeformStatus,
 } from './forge-lifeforms.js';
+export type { ForgeMemory, ForgeMemoryStatus } from './forge-memories.js';
 
 export type ForgeLoopStatus =
   | 'DRAFT'
@@ -201,6 +209,31 @@ export interface ForgeLoopService {
     status: Exclude<ForgeLifeformStatus, 'ACTIVE'> | 'ACTIVE';
     audit: ForgeAudit;
   }): Promise<ForgeLifeform>;
+  createMemory(input: {
+    intentId: string;
+    text: string;
+    audit: ForgeAudit;
+  }): Promise<ForgeMemory>;
+  listMemories(input: {
+    intentId: string;
+    tenantId: string;
+    includeForgotten?: boolean;
+  }): Promise<readonly ForgeMemory[]>;
+  getMemory(input: {
+    intentId: string;
+    memoryId: string;
+    tenantId: string;
+  }): Promise<ForgeMemory | undefined>;
+  forgetMemory(input: {
+    intentId: string;
+    memoryId: string;
+    audit: ForgeAudit;
+  }): Promise<ForgeMemory>;
+  promoteMemory(input: {
+    intentId: string;
+    memoryId: string;
+    audit: ForgeAudit;
+  }): Promise<{ memory: ForgeMemory; intent: ForgeIntent }>;
 }
 
 export class ForgeLoopError extends Error {
@@ -234,6 +267,7 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
   private readonly allocations = new Map<string, ForgeCreditAllocation[]>();
   private readonly snapshots = new Map<string, ForgeSnapshot>();
   private readonly lifeforms = new Map<string, ForgeLifeform>();
+  private readonly memories = new Map<string, ForgeMemory>();
   private readonly bridge: ForgePxnBridge;
 
   constructor(
@@ -1074,6 +1108,137 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
       status: next.status,
     });
     return next;
+  }
+
+  async createMemory(input: {
+    intentId: string;
+    text: string;
+    audit: ForgeAudit;
+  }): Promise<ForgeMemory> {
+    const intent = await this.get({ id: input.intentId, tenantId: input.audit.tenantId });
+    if (!intent) throw new ForgeLoopError('INTENT_NOT_FOUND');
+    const text = input.text.trim();
+    if (!text) throw new ForgeLoopError('MEMORY_TEXT_REQUIRED');
+    const memory = freezeMemory({
+      id: newMemoryId(),
+      intentId: input.intentId,
+      tenantId: input.audit.tenantId,
+      text,
+      status: 'ACTIVE',
+      consensus: false,
+      createdAt: input.audit.occurredAt,
+      updatedAt: input.audit.occurredAt,
+      createdBy: input.audit.actorId,
+    });
+    this.memories.set(memory.id, memory);
+    this.appendIntentEvent(input.intentId, input.audit, 'forge.memory.created', {
+      memoryId: memory.id,
+      text: memory.text,
+    });
+    return memory;
+  }
+
+  async listMemories(input: {
+    intentId: string;
+    tenantId: string;
+    includeForgotten?: boolean;
+  }): Promise<readonly ForgeMemory[]> {
+    const intent = await this.get({ id: input.intentId, tenantId: input.tenantId });
+    if (!intent) throw new ForgeLoopError('INTENT_NOT_FOUND');
+    return Object.freeze(
+      [...this.memories.values()]
+        .filter((item) => item.intentId === input.intentId && item.tenantId === input.tenantId)
+        .filter((item) => input.includeForgotten || item.status !== 'FORGOTTEN')
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)),
+    );
+  }
+
+  async getMemory(input: {
+    intentId: string;
+    memoryId: string;
+    tenantId: string;
+  }): Promise<ForgeMemory | undefined> {
+    const memory = this.memories.get(input.memoryId);
+    if (!memory || memory.intentId !== input.intentId || memory.tenantId !== input.tenantId) {
+      return undefined;
+    }
+    return memory;
+  }
+
+  async forgetMemory(input: {
+    intentId: string;
+    memoryId: string;
+    audit: ForgeAudit;
+  }): Promise<ForgeMemory> {
+    const memory = await this.getMemory({
+      intentId: input.intentId,
+      memoryId: input.memoryId,
+      tenantId: input.audit.tenantId,
+    });
+    if (!memory) throw new ForgeLoopError('MEMORY_NOT_FOUND');
+    if (memory.status === 'FORGOTTEN') return memory;
+    if (memory.status === 'PROMOTED') throw new ForgeLoopError('MEMORY_ALREADY_PROMOTED');
+    const next = freezeMemory({
+      ...memory,
+      status: 'FORGOTTEN' as ForgeMemoryStatus,
+      updatedAt: input.audit.occurredAt,
+      forgottenAt: input.audit.occurredAt,
+    });
+    this.memories.set(next.id, next);
+    this.appendIntentEvent(input.intentId, input.audit, 'forge.memory.forgotten', {
+      memoryId: next.id,
+    });
+    return next;
+  }
+
+  async promoteMemory(input: {
+    intentId: string;
+    memoryId: string;
+    audit: ForgeAudit;
+  }): Promise<{ memory: ForgeMemory; intent: ForgeIntent }> {
+    const memory = await this.getMemory({
+      intentId: input.intentId,
+      memoryId: input.memoryId,
+      tenantId: input.audit.tenantId,
+    });
+    if (!memory) throw new ForgeLoopError('MEMORY_NOT_FOUND');
+    if (memory.status === 'FORGOTTEN') throw new ForgeLoopError('MEMORY_FORGOTTEN');
+    if (memory.status === 'PROMOTED') {
+      const intent = await this.get({ id: input.intentId, tenantId: input.audit.tenantId });
+      if (!intent) throw new ForgeLoopError('INTENT_NOT_FOUND');
+      return { memory, intent };
+    }
+    const record = this.intents.get(input.intentId);
+    if (!record || record.view.tenantId !== input.audit.tenantId) {
+      throw new ForgeLoopError('INTENT_NOT_FOUND');
+    }
+    if (record.view.frozen) throw new ForgeLoopError('INTENT_FROZEN');
+    const promotedConstraint = constraintFromMemory(memory.text);
+    const nextConstraints = Object.freeze([
+      ...record.view.constraints,
+      promotedConstraint,
+    ]);
+    const nextMemory = freezeMemory({
+      ...memory,
+      status: 'PROMOTED',
+      consensus: true,
+      promotedConstraint,
+      updatedAt: input.audit.occurredAt,
+      promotedAt: input.audit.occurredAt,
+    });
+    this.memories.set(nextMemory.id, nextMemory);
+    this.appendIntentEvent(input.intentId, input.audit, 'forge.memory.promoted', {
+      memoryId: nextMemory.id,
+      constraint: promotedConstraint,
+      consensus: true,
+    });
+    record.view = Object.freeze({
+      ...record.view,
+      constraints: nextConstraints,
+      updatedAt: input.audit.occurredAt,
+      events: Object.freeze([...record.events]),
+    });
+    return { memory: nextMemory, intent: record.view };
   }
 }
 
