@@ -35,6 +35,13 @@ import {
   computeReputationScore,
   type ForgeReputation,
 } from './forge-reputation.js';
+import {
+  freezeSnapshot,
+  hashSnapshotContent,
+  snapshotIdFor,
+  summarizeJudgments,
+  type ForgeSnapshot,
+} from './forge-snapshots.js';
 
 export type { ForgeConstraint } from './forge-constraints.js';
 export type { ForgeJudgment, ForgeJudgmentAction, ForgeVariantCandidate } from './forge-judgments.js';
@@ -47,6 +54,7 @@ export type {
 export { DEFAULT_ALLOCATION_WEIGHTS } from './forge-allocations.js';
 export type { ForgeReputation } from './forge-reputation.js';
 export { REPUTATION_BASELINE } from './forge-reputation.js';
+export type { ForgeSnapshot } from './forge-snapshots.js';
 
 export type ForgeLoopStatus =
   | 'DRAFT'
@@ -148,6 +156,13 @@ export interface ForgeLoopService {
     intentId: string;
     tenantId: string;
   }): Promise<readonly ForgeCreditAllocation[]>;
+  createSnapshot(input: { intentId: string; audit: ForgeAudit }): Promise<ForgeSnapshot>;
+  listSnapshots(input: { intentId: string; tenantId: string }): Promise<readonly ForgeSnapshot[]>;
+  restoreSnapshot(input: {
+    intentId: string;
+    snapshotId: string;
+    audit: ForgeAudit;
+  }): Promise<ForgeIntent>;
 }
 
 export class ForgeLoopError extends Error {
@@ -179,6 +194,7 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
   private readonly intents = new Map<string, MutableIntent>();
   private readonly judgments = new Map<string, ForgeJudgment>();
   private readonly allocations = new Map<string, ForgeCreditAllocation[]>();
+  private readonly snapshots = new Map<string, ForgeSnapshot>();
   private readonly bridge: ForgePxnBridge;
 
   constructor(
@@ -745,6 +761,107 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
     const intent = await this.get({ id: input.intentId, tenantId: input.tenantId });
     if (!intent) throw new ForgeLoopError('INTENT_NOT_FOUND');
     return Object.freeze([...(this.allocations.get(input.intentId) ?? [])]);
+  }
+
+  async createSnapshot(input: { intentId: string; audit: ForgeAudit }): Promise<ForgeSnapshot> {
+    const intent = await this.get({ id: input.intentId, tenantId: input.audit.tenantId });
+    if (!intent) throw new ForgeLoopError('INTENT_NOT_FOUND');
+    if (intent.status !== 'STAKED' && intent.status !== 'CONFIRMED') {
+      throw new ForgeLoopError('SNAPSHOT_NOT_ALLOWED');
+    }
+    const judgments = await this.listJudgments({
+      intentId: input.intentId,
+      tenantId: input.audit.tenantId,
+    });
+    const judgmentsSummary = summarizeJudgments(judgments);
+    const contentHash = hashSnapshotContent({
+      statement: intent.statement,
+      constraints: intent.constraints,
+      frozen: intent.frozen,
+      judgmentsSummary,
+    });
+    const snapshot = freezeSnapshot({
+      id: snapshotIdFor(input.intentId, contentHash, input.audit.occurredAt),
+      intentId: input.intentId,
+      tenantId: input.audit.tenantId,
+      statement: intent.statement,
+      constraints: intent.constraints,
+      frozen: intent.frozen,
+      judgmentsSummary,
+      contentHash,
+      ...(intent.pxnTaskId ? { pxnTaskId: intent.pxnTaskId } : {}),
+      createdAt: input.audit.occurredAt,
+      createdBy: input.audit.actorId,
+    });
+    this.snapshots.set(snapshot.id, snapshot);
+    const record = this.intents.get(input.intentId);
+    if (record) {
+      const ev = event('forge.intent.snapshot_taken', input.audit, {
+        snapshotId: snapshot.id,
+        contentHash: snapshot.contentHash,
+        pxnTaskId: snapshot.pxnTaskId ?? null,
+      });
+      record.events.push(ev);
+      record.view = Object.freeze({
+        ...record.view,
+        updatedAt: input.audit.occurredAt,
+        events: Object.freeze([...record.events]),
+      });
+    }
+    return snapshot;
+  }
+
+  async listSnapshots(input: {
+    intentId: string;
+    tenantId: string;
+  }): Promise<readonly ForgeSnapshot[]> {
+    const intent = await this.get({ id: input.intentId, tenantId: input.tenantId });
+    if (!intent) throw new ForgeLoopError('INTENT_NOT_FOUND');
+    return Object.freeze(
+      [...this.snapshots.values()]
+        .filter((item) => item.intentId === input.intentId && item.tenantId === input.tenantId)
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt)),
+    );
+  }
+
+  async restoreSnapshot(input: {
+    intentId: string;
+    snapshotId: string;
+    audit: ForgeAudit;
+  }): Promise<ForgeIntent> {
+    const record = this.intents.get(input.intentId);
+    if (!record || record.view.tenantId !== input.audit.tenantId) {
+      throw new ForgeLoopError('INTENT_NOT_FOUND');
+    }
+    if (record.view.status !== 'STAKED' && record.view.status !== 'CONFIRMED') {
+      throw new ForgeLoopError('ROLLBACK_NOT_ALLOWED');
+    }
+    const snapshot = this.snapshots.get(input.snapshotId);
+    if (!snapshot || snapshot.intentId !== input.intentId || snapshot.tenantId !== input.audit.tenantId) {
+      throw new ForgeLoopError('SNAPSHOT_NOT_FOUND');
+    }
+    const previous = {
+      statement: record.view.statement,
+      constraints: record.view.constraints,
+      frozen: record.view.frozen,
+    };
+    const ev = event('forge.intent.rolled_back', input.audit, {
+      snapshotId: snapshot.id,
+      contentHash: snapshot.contentHash,
+      pxnTaskId: record.view.pxnTaskId ?? snapshot.pxnTaskId ?? null,
+      previousStatement: previous.statement,
+      restoredStatement: snapshot.statement,
+    });
+    record.events.push(ev);
+    record.view = Object.freeze({
+      ...record.view,
+      statement: snapshot.statement,
+      constraints: snapshot.constraints,
+      frozen: snapshot.frozen,
+      updatedAt: input.audit.occurredAt,
+      events: Object.freeze([...record.events]),
+    });
+    return record.view;
   }
 }
 

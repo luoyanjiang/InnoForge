@@ -423,6 +423,94 @@ export function registerForgeRoutes(app: FastifyInstance, service: ForgeLoopServ
     }
   });
 
+  app.get<{
+    Headers: Pick<Headers, 'x-actor-id' | 'x-tenant-id'>;
+    Params: { intentId: string };
+  }>('/v1/forge/intents/:intentId/snapshots', {
+    schema: {
+      operationId: 'listForgeSnapshots',
+      summary: 'List governance snapshots for an intent (G6)',
+      tags: ['InnoForge'],
+      headers: readHeaders,
+      params: { type: 'object', required: ['intentId'], properties: { intentId: id } },
+      response: { 200: response, 404: errorResponse },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.send({
+        snapshots: await service.listSnapshots({
+          intentId: request.params.intentId,
+          tenantId: request.headers['x-tenant-id'],
+        }),
+      });
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
+  app.post<{
+    Headers: Headers;
+    Params: { intentId: string };
+  }>('/v1/forge/intents/:intentId/snapshots', {
+    schema: {
+      operationId: 'createForgeSnapshot',
+      summary: 'Create immutable governance snapshot of statement/constraints (G6)',
+      tags: ['InnoForge'],
+      headers,
+      params: { type: 'object', required: ['intentId'], properties: { intentId: id } },
+      response: {
+        201: response,
+        403: errorResponse,
+        404: errorResponse,
+        409: errorResponse,
+        500: errorResponse,
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.code(201).send(await service.createSnapshot({
+        intentId: request.params.intentId,
+        audit: audit(request),
+      }));
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
+  app.post<{
+    Headers: Headers;
+    Params: { intentId: string; snapshotId: string };
+  }>('/v1/forge/intents/:intentId/snapshots/:snapshotId/restore', {
+    schema: {
+      operationId: 'restoreForgeSnapshot',
+      summary: 'Rollback mutable projection to a snapshot (G6); blocked after deploy',
+      tags: ['InnoForge'],
+      headers,
+      params: {
+        type: 'object',
+        required: ['intentId', 'snapshotId'],
+        properties: { intentId: id, snapshotId: id },
+      },
+      response: {
+        200: response,
+        403: errorResponse,
+        404: errorResponse,
+        409: errorResponse,
+        500: errorResponse,
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.send(await service.restoreSnapshot({
+        intentId: request.params.intentId,
+        snapshotId: request.params.snapshotId,
+        audit: audit(request),
+      }));
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
   app.post<{
     Headers: Headers;
     Params: { intentId: string };

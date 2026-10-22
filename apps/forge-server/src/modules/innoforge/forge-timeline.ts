@@ -12,6 +12,8 @@ export type ForgeTimelineKind =
   | 'DEPLOYED'
   | 'FEEDBACK'
   | 'SETTLED'
+  | 'SNAPSHOT'
+  | 'ROLLED_BACK'
   | 'OTHER';
 
 export type ForgeTimelineItem = Readonly<{
@@ -35,6 +37,8 @@ const EVENT_KIND: Readonly<Record<string, ForgeTimelineKind>> = Object.freeze({
   'forge.deploy.started': 'DEPLOYED',
   'forge.feedback.tick': 'FEEDBACK',
   'forge.credit.settled': 'SETTLED',
+  'forge.intent.snapshot_taken': 'SNAPSHOT',
+  'forge.intent.rolled_back': 'ROLLED_BACK',
 });
 
 export function timelineKindFromEventType(type: string): ForgeTimelineKind {
