@@ -73,7 +73,24 @@ test('closed loop stakes credit, requires confirm, deploys via gateway, settles 
   assert.equal(settled.status, 'SETTLED');
   assert.equal(settled.creditMinted, 60);
   assert.equal(settled.pxnPath?.taskState, 'COMPLETED');
-  assert.equal((await service.getAccount({ tenantId: 'tenant.demo', principalId: 'user.demo' }))?.balance, 220);
+  // G4: empty suggester pool folds into proposer; confirmer (approver.demo) still gets 29.5%.
+  const allocations = await service.listAllocations({
+    intentId: 'forge:loop-1',
+    tenantId: 'tenant.demo',
+  });
+  assert.equal(allocations.reduce((sum, item) => sum + item.amount, 0), 60);
+  const proposerShare = allocations
+    .filter((item) => item.principalId === 'user.demo')
+    .reduce((sum, item) => sum + item.amount, 0);
+  assert.equal(
+    (await service.getAccount({ tenantId: 'tenant.demo', principalId: 'user.demo' }))?.balance,
+    160 + proposerShare,
+  );
+  const confirmerShare = allocations
+    .filter((item) => item.principalId === 'approver.demo')
+    .reduce((sum, item) => sum + item.amount, 0);
+  assert.ok(confirmerShare > 0);
+  assert.equal(proposerShare + confirmerShare, 60);
 });
 
 test('HTTP routes expose designed console shell and forge loop APIs', async () => {

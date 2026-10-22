@@ -332,6 +332,43 @@ export function registerForgeRoutes(app: FastifyInstance, service: ForgeLoopServ
     candidates: await service.listVariantCandidates(),
   }));
 
+  app.get('/v1/forge/allocation-weights', {
+    schema: {
+      operationId: 'getForgeAllocationWeights',
+      summary: 'Default Credit attribution weights (G4)',
+      tags: ['InnoForge'],
+      response: { 200: response },
+    },
+  }, async () => ({
+    weights: await service.getAllocationWeights(),
+  }));
+
+  app.get<{
+    Headers: Pick<Headers, 'x-actor-id' | 'x-tenant-id'>;
+    Params: { intentId: string };
+  }>('/v1/forge/intents/:intentId/allocations', {
+    schema: {
+      operationId: 'listForgeAllocations',
+      summary: 'List Credit allocations for a settled intent (G4)',
+      tags: ['InnoForge'],
+      headers: readHeaders,
+      params: { type: 'object', required: ['intentId'], properties: { intentId: id } },
+      response: { 200: response, 404: errorResponse },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.send({
+        allocations: await service.listAllocations({
+          intentId: request.params.intentId,
+          tenantId: request.headers['x-tenant-id'],
+        }),
+        weights: await service.getAllocationWeights(),
+      });
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
   app.get<{
     Headers: Pick<Headers, 'x-actor-id' | 'x-tenant-id'>;
     Querystring: { intent_id?: string };

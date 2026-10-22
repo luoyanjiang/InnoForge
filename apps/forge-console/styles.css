@@ -531,6 +531,15 @@ button { cursor: pointer; border: 0; }
   .constraint-row { grid-template-columns: 1fr 1fr; }
 }
 
+/* G4 — value realized split rows */
+.realized-block {
+  margin-top: 0.75rem;
+  padding-top: 0.55rem;
+  border-top: 1px solid var(--line);
+}
+.realized-row { font-size: 0.82rem; color: #c9d4e8; }
+.realized-row strong { color: var(--cyan); font-variant-numeric: tabular-nums; }
+
 /* G3 — intent & judgment history timeline */
 .history-toolbar {
   display: flex;

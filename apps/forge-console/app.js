@@ -29,6 +29,8 @@ const state = {
   judgments: [],
   timeline: [],
   historyFilter: localStorage.getItem('forge.historyFilter') || 'all',
+  allocationWeights: { proposer: 38.5, suggester: 32, confirmer: 29.5 },
+  allocationsByIntent: {},
   lumenLog: [],
   marketOwned: JSON.parse(localStorage.getItem('forge.market') || 'false'),
   connFilter: 'all',
@@ -1001,21 +1003,63 @@ function renderGovernance() {
   });
 }
 
+async function refreshAllocations() {
+  try {
+    const data = await api('GET', '/v1/forge/allocation-weights');
+    if (data.weights) state.allocationWeights = data.weights;
+  } catch {
+    /* keep defaults */
+  }
+  const settled = state.intents.filter((i) => i.status === 'SETTLED');
+  const next = {};
+  await Promise.all(settled.map(async (intent) => {
+    try {
+      const data = await api('GET', `/v1/forge/intents/${encodeURIComponent(intent.id)}/allocations`);
+      next[intent.id] = data.allocations || [];
+      if (data.weights) state.allocationWeights = data.weights;
+    } catch {
+      next[intent.id] = [];
+    }
+  }));
+  state.allocationsByIntent = next;
+}
+
+function roleLabel(role) {
+  if (role === 'proposer') return tt('proposer');
+  if (role === 'suggester') return tt('suggester');
+  if (role === 'confirmer') return tt('confirmer');
+  return role;
+}
+
 function renderEquity() {
   setHeader(tt('navEquity'), tt('equityTitle'), tt('equitySub'));
   const settled = state.intents.filter((i) => i.status === 'SETTLED');
   const minted = settled.reduce((sum, i) => sum + (i.creditMinted || 0), 0);
+  const w = state.allocationWeights || {};
+  const fmtPct = (n) => `${Number(n ?? 0).toFixed(1)}%`;
   el('content').innerHTML = `
     <div class="grid-3">
-      <div class="panel"><div class="stat-label">${tt('proposer')}</div><div class="stat-value">38.5%</div></div>
-      <div class="panel"><div class="stat-label">${tt('suggester')}</div><div class="stat-value">32.0%</div></div>
-      <div class="panel"><div class="stat-label">${tt('confirmer')}</div><div class="stat-value">29.5%</div></div>
+      <div class="panel"><div class="stat-label">${tt('proposer')}</div><div class="stat-value">${fmtPct(w.proposer)}</div><div class="stat-sub">${tt('weightFromConfig')}</div></div>
+      <div class="panel"><div class="stat-label">${tt('suggester')}</div><div class="stat-value">${fmtPct(w.suggester)}</div><div class="stat-sub">${tt('weightFromConfig')}</div></div>
+      <div class="panel"><div class="stat-label">${tt('confirmer')}</div><div class="stat-value">${fmtPct(w.confirmer)}</div><div class="stat-sub">${tt('weightFromConfig')}</div></div>
     </div>
-    <div class="panel" style="margin-top:0.85rem">
+    <div class="panel" style="margin-top:0.85rem" id="realized-panel">
+      <h3>${tt('realizedTitle')}</h3>
       <div class="stat-label">${tt('minted')}</div>
       <div class="stat-value cyan">${minted}</div>
       <div class="stat-sub">${tt('settlePreview')} · ${settled.length} settled</div>
-      ${settled.map((i) => `<div class="list-row"><span>${i.statement.slice(0, 42)}</span><span>+${i.creditMinted}</span></div>`).join('')}
+      ${settled.length ? settled.map((intent) => {
+        const rows = state.allocationsByIntent[intent.id] || [];
+        return `
+          <div class="realized-block">
+            <div class="list-row"><span>${escapeAttr(intent.statement.slice(0, 48))}</span><span class="cyan">+${intent.creditMinted ?? 0}</span></div>
+            ${rows.length ? rows.map((row) => `
+              <div class="list-row realized-row">
+                <span>${roleLabel(row.role)} · <span class="mono">${escapeAttr(row.principalId)}</span></span>
+                <span>${Number(row.weightPercent).toFixed(1)}% · <strong>+${row.amount}</strong></span>
+              </div>`).join('') : `<p class="empty">${tt('realizedNoSplit')}</p>`}
+          </div>`;
+      }).join('') : `<p class="empty">${tt('realizedEmpty')}</p>`}
     </div>`;
 }
 
@@ -1085,6 +1129,10 @@ function renderPage() {
   }
   if (state.page === 'history') {
     void refreshTimeline().then(() => renderHistory());
+    return;
+  }
+  if (state.page === 'equity') {
+    void refreshAllocations().then(() => renderEquity());
     return;
   }
   (map[state.page] || renderOverview)();
