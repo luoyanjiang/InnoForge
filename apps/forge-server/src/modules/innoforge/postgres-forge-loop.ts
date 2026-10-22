@@ -72,6 +72,21 @@ import {
   type ForgeMemory,
   type ForgeMemoryStatus,
 } from './forge-memories.js';
+import {
+  canAdvanceCollabStage,
+  freezeIntentTree,
+  freezeTreeNode,
+  newTreeNodeId,
+  normalizeCollabStage,
+  normalizeIntentTree,
+  normalizeScenario,
+  seedIntentTree,
+  type ForgeCollabStage,
+  type ForgeIntentTree,
+  type ForgeScenario,
+  type ForgeTreeNodeKind,
+  type ForgeTreeNodeStatus,
+} from './forge-intent-tree.js';
 
 type JudgmentRow = {
   id: string;
@@ -95,6 +110,9 @@ type IntentRow = {
   frozen: boolean | null;
   stake: string;
   status: ForgeLoopStatus;
+  scenario: ForgeScenario | null;
+  collab_stage: ForgeCollabStage | null;
+  intent_tree: ForgeIntentTree | Record<string, unknown> | null;
   adapter_id: string;
   pxn_task_id: string | null;
   pxn_path: ForgePxnPath | null;
@@ -226,11 +244,13 @@ export class PostgresForgeLoopService implements ForgeLoopService {
     constraints?: readonly ForgeConstraint[] | unknown;
     adapterId?: string;
     pxnTaskId?: string;
+    scenario?: ForgeScenario | string;
     audit: ForgeAudit;
   }): Promise<ForgeIntent> {
     if (!(input.stake > 0) || !Number.isFinite(input.stake)) throw new ForgeLoopError('STAKE_INVALID');
     if (!input.statement.trim()) throw new ForgeLoopError('STATEMENT_REQUIRED');
     const constraints = normalizeConstraints(input.constraints);
+    const scenario = normalizeScenario(input.scenario);
     const existing = await this.get({ id: input.id, tenantId: input.audit.tenantId });
     if (existing) {
       if (
@@ -252,6 +272,12 @@ export class PostgresForgeLoopService implements ForgeLoopService {
       ...(input.pxnTaskId ? { existingTaskId: input.pxnTaskId } : {}),
       audit: input.audit,
     });
+    const intentTree = seedIntentTree({
+      intentId: input.id,
+      statement: input.statement.trim(),
+      constraints,
+      at: input.audit.occurredAt,
+    });
     await this.ensureAccount({ tenantId: input.audit.tenantId, principalId: input.audit.actorId });
     const client = await this.pool.connect();
     try {
@@ -272,8 +298,8 @@ export class PostgresForgeLoopService implements ForgeLoopService {
       await client.query(
         `INSERT INTO forge_intents
           (id, tenant_id, principal_id, statement, constraints, frozen, stake, status, adapter_id,
-           pxn_task_id, pxn_path, created_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5::jsonb,false,$6,'STAKED',$7,$8,$9::jsonb,$10::timestamptz,$10::timestamptz)`,
+           pxn_task_id, pxn_path, scenario, collab_stage, intent_tree, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5::jsonb,false,$6,'STAKED',$7,$8,$9::jsonb,$10,'DRAFT',$11::jsonb,$12::timestamptz,$12::timestamptz)`,
         [
           input.id,
           input.audit.tenantId,
@@ -284,6 +310,8 @@ export class PostgresForgeLoopService implements ForgeLoopService {
           adapterId,
           pxnPath.taskId,
           JSON.stringify(pxnPath),
+          scenario,
+          JSON.stringify(intentTree),
           input.audit.occurredAt,
         ],
       );
@@ -294,6 +322,8 @@ export class PostgresForgeLoopService implements ForgeLoopService {
         pxnTaskId: pxnPath.taskId,
         pxnTaskState: pxnPath.taskState ?? null,
         constraints,
+        scenario,
+        collabStage: 'DRAFT',
       };
       await this.insertEvent(client, input.id, 'forge.intent.staked', input.audit, payload);
       await this.appendDomainEvent(client, input.id, 'forge.intent.staked', input.audit, payload);
@@ -314,6 +344,8 @@ export class PostgresForgeLoopService implements ForgeLoopService {
     statement?: string;
     constraints?: readonly ForgeConstraint[] | unknown;
     frozen?: boolean;
+    scenario?: ForgeScenario | string;
+    collabStage?: ForgeCollabStage | string;
     audit: ForgeAudit;
   }): Promise<ForgeIntent> {
     const current = await this.requireIntent(input.id, input.audit.tenantId);
@@ -332,24 +364,42 @@ export class PostgresForgeLoopService implements ForgeLoopService {
     const nextConstraints = input.constraints !== undefined
       ? normalizeConstraints(input.constraints)
       : current.constraints;
+    const nextScenario = input.scenario !== undefined
+      ? normalizeScenario(input.scenario)
+      : current.scenario;
+    let nextStage = current.collabStage;
+    if (input.collabStage !== undefined) {
+      const target = normalizeCollabStage(input.collabStage);
+      if (target !== current.collabStage) {
+        if (!canAdvanceCollabStage(current.collabStage, target)) {
+          throw new ForgeLoopError('COLLAB_STAGE_INVALID');
+        }
+        nextStage = target;
+      }
+    }
     const contentChanged =
       nextStatement !== current.statement
       || !constraintsEqual(nextConstraints, current.constraints);
     const freezeChanged = nextFrozen !== current.frozen;
-    if (!contentChanged && !freezeChanged) return current;
+    const scenarioChanged = nextScenario !== current.scenario;
+    const stageChanged = nextStage !== current.collabStage;
+    if (!contentChanged && !freezeChanged && !scenarioChanged && !stageChanged) return current;
 
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
       await client.query(
         `UPDATE forge_intents
-            SET statement=$2, constraints=$3::jsonb, frozen=$4, updated_at=$5::timestamptz
-          WHERE id=$1 AND tenant_id=$6`,
+            SET statement=$2, constraints=$3::jsonb, frozen=$4, scenario=$5, collab_stage=$6,
+                updated_at=$7::timestamptz
+          WHERE id=$1 AND tenant_id=$8`,
         [
           input.id,
           nextStatement,
           JSON.stringify(nextConstraints),
           nextFrozen,
+          nextScenario,
+          nextStage,
           input.audit.occurredAt,
           input.audit.tenantId,
         ],
@@ -364,6 +414,16 @@ export class PostgresForgeLoopService implements ForgeLoopService {
         const payload = { frozen: nextFrozen };
         await this.insertEvent(client, input.id, type, input.audit, payload);
         await this.appendDomainEvent(client, input.id, type, input.audit, payload);
+      }
+      if (scenarioChanged) {
+        const payload = { scenario: nextScenario, previous: current.scenario };
+        await this.insertEvent(client, input.id, 'forge.scenario.changed', input.audit, payload);
+        await this.appendDomainEvent(client, input.id, 'forge.scenario.changed', input.audit, payload);
+      }
+      if (stageChanged) {
+        const payload = { collabStage: nextStage, previous: current.collabStage };
+        await this.insertEvent(client, input.id, 'forge.collab_stage.changed', input.audit, payload);
+        await this.appendDomainEvent(client, input.id, 'forge.collab_stage.changed', input.audit, payload);
       }
       await client.query('COMMIT');
     } catch (error) {
@@ -1468,6 +1528,16 @@ export class PostgresForgeLoopService implements ForgeLoopService {
     if (constraints.length === 0) {
       constraints = legacyConstraintsFromStatement(row.statement);
     }
+    const at = new Date(row.updated_at).toISOString();
+    let intentTree = normalizeIntentTree(row.intent_tree, at);
+    if (intentTree.nodes.length === 0) {
+      intentTree = seedIntentTree({
+        intentId: row.id,
+        statement: row.statement,
+        constraints,
+        at,
+      });
+    }
     return Object.freeze({
       id: row.id,
       tenantId: row.tenant_id,
@@ -1477,6 +1547,9 @@ export class PostgresForgeLoopService implements ForgeLoopService {
       frozen: Boolean(row.frozen),
       stake: Number(row.stake),
       status: row.status,
+      scenario: normalizeScenario(row.scenario),
+      collabStage: normalizeCollabStage(row.collab_stage),
+      intentTree,
       adapterId: row.adapter_id,
       ...(row.pxn_task_id ? { pxnTaskId: row.pxn_task_id } : {}),
       ...(row.pxn_path ? { pxnPath: immutableJsonCopy(row.pxn_path) } : {}),
@@ -1484,11 +1557,147 @@ export class PostgresForgeLoopService implements ForgeLoopService {
       ...(row.deploy_job ? { deployJob: immutableJsonCopy(row.deploy_job) } : {}),
       ...(row.credit_minted != null ? { creditMinted: Number(row.credit_minted) } : {}),
       createdAt: new Date(row.created_at).toISOString(),
-      updatedAt: new Date(row.updated_at).toISOString(),
+      updatedAt: at,
       ...(row.confirmed_at ? { confirmedAt: new Date(row.confirmed_at).toISOString() } : {}),
       ...(row.settled_at ? { settledAt: new Date(row.settled_at).toISOString() } : {}),
       events: Object.freeze(mappedEvents),
     });
+  }
+
+  async getIntentTree(input: {
+    intentId: string;
+    tenantId: string;
+  }): Promise<ForgeIntentTree> {
+    const intent = await this.requireIntent(input.intentId, input.tenantId);
+    return intent.intentTree;
+  }
+
+  async replaceIntentTree(input: {
+    intentId: string;
+    tree: ForgeIntentTree | unknown;
+    audit: ForgeAudit;
+  }): Promise<ForgeIntentTree> {
+    await this.requireIntent(input.intentId, input.audit.tenantId);
+    const tree = normalizeIntentTree(input.tree, input.audit.occurredAt);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE forge_intents
+            SET intent_tree=$2::jsonb, updated_at=$3::timestamptz
+          WHERE id=$1 AND tenant_id=$4`,
+        [input.intentId, JSON.stringify(tree), input.audit.occurredAt, input.audit.tenantId],
+      );
+      const payload = { nodeCount: tree.nodes.length };
+      await this.insertEvent(client, input.intentId, 'forge.tree.replaced', input.audit, payload);
+      await this.appendDomainEvent(client, input.intentId, 'forge.tree.replaced', input.audit, payload);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    return tree;
+  }
+
+  async addTreeNode(input: {
+    intentId: string;
+    parentId?: string | null;
+    kind: ForgeTreeNodeKind | string;
+    title: string;
+    audit: ForgeAudit;
+  }): Promise<ForgeIntentTree> {
+    const intent = await this.requireIntent(input.intentId, input.audit.tenantId);
+    const title = input.title.trim();
+    if (!title) throw new ForgeLoopError('TREE_NODE_TITLE_REQUIRED');
+    const kind: ForgeTreeNodeKind =
+      input.kind === 'CONSTRAINT'
+      || input.kind === 'SUCCESS'
+      || input.kind === 'BRANCH'
+      || input.kind === 'GOAL'
+        ? input.kind
+        : 'BRANCH';
+    const parentId = input.parentId === undefined ? null : input.parentId;
+    if (parentId && !intent.intentTree.nodes.some((n) => n.id === parentId)) {
+      throw new ForgeLoopError('TREE_PARENT_NOT_FOUND');
+    }
+    const node = freezeTreeNode({
+      id: newTreeNodeId(),
+      parentId,
+      kind,
+      title,
+      status: 'OPEN',
+    });
+    const tree = freezeIntentTree({
+      nodes: [...intent.intentTree.nodes, node],
+      updatedAt: input.audit.occurredAt,
+    });
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE forge_intents
+            SET intent_tree=$2::jsonb, updated_at=$3::timestamptz
+          WHERE id=$1 AND tenant_id=$4`,
+        [input.intentId, JSON.stringify(tree), input.audit.occurredAt, input.audit.tenantId],
+      );
+      const payload = { nodeId: node.id, kind: node.kind, title: node.title };
+      await this.insertEvent(client, input.intentId, 'forge.tree.node_added', input.audit, payload);
+      await this.appendDomainEvent(client, input.intentId, 'forge.tree.node_added', input.audit, payload);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    return tree;
+  }
+
+  async updateTreeNode(input: {
+    intentId: string;
+    nodeId: string;
+    title?: string;
+    status?: ForgeTreeNodeStatus | string;
+    audit: ForgeAudit;
+  }): Promise<ForgeIntentTree> {
+    const intent = await this.requireIntent(input.intentId, input.audit.tenantId);
+    const index = intent.intentTree.nodes.findIndex((n) => n.id === input.nodeId);
+    if (index < 0) throw new ForgeLoopError('TREE_NODE_NOT_FOUND');
+    const current = intent.intentTree.nodes[index]!;
+    const nextTitle = input.title !== undefined ? input.title.trim() : current.title;
+    if (!nextTitle) throw new ForgeLoopError('TREE_NODE_TITLE_REQUIRED');
+    const nextStatus: ForgeTreeNodeStatus =
+      input.status === 'ALIGNED'
+      || input.status === 'CONFLICT'
+      || input.status === 'DONE'
+      || input.status === 'OPEN'
+        ? input.status
+        : current.status;
+    const nodes = [...intent.intentTree.nodes];
+    nodes[index] = freezeTreeNode({ ...current, title: nextTitle, status: nextStatus });
+    const tree = freezeIntentTree({ nodes, updatedAt: input.audit.occurredAt });
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE forge_intents
+            SET intent_tree=$2::jsonb, updated_at=$3::timestamptz
+          WHERE id=$1 AND tenant_id=$4`,
+        [input.intentId, JSON.stringify(tree), input.audit.occurredAt, input.audit.tenantId],
+      );
+      const payload = { nodeId: input.nodeId, title: nextTitle, status: nextStatus };
+      await this.insertEvent(client, input.intentId, 'forge.tree.node_updated', input.audit, payload);
+      await this.appendDomainEvent(client, input.intentId, 'forge.tree.node_updated', input.audit, payload);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    return tree;
   }
 
   private async insertEvent(

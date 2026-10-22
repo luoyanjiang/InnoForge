@@ -230,6 +230,7 @@ export function registerForgeRoutes(app: FastifyInstance, service: ForgeLoopServ
       constraints?: Array<{ key: string; op: string; value: string; unit?: string }>;
       adapter_id?: string;
       pxn_task_id?: string;
+      scenario?: 'PRODUCT' | 'RESEARCH' | 'HARDWARE';
     };
   }>('/v1/forge/intents', {
     schema: {
@@ -248,6 +249,7 @@ export function registerForgeRoutes(app: FastifyInstance, service: ForgeLoopServ
           constraints: { type: 'array', maxItems: 32, items: constraintItem },
           adapter_id: id,
           pxn_task_id: id,
+          scenario: { type: 'string', enum: ['PRODUCT', 'RESEARCH', 'HARDWARE'] },
         },
       },
       response: {
@@ -267,6 +269,7 @@ export function registerForgeRoutes(app: FastifyInstance, service: ForgeLoopServ
         ...(request.body.constraints !== undefined ? { constraints: request.body.constraints } : {}),
         ...(request.body.adapter_id !== undefined ? { adapterId: request.body.adapter_id } : {}),
         ...(request.body.pxn_task_id !== undefined ? { pxnTaskId: request.body.pxn_task_id } : {}),
+        ...(request.body.scenario !== undefined ? { scenario: request.body.scenario } : {}),
         audit: audit(request),
       }));
     } catch (error) {
@@ -281,11 +284,13 @@ export function registerForgeRoutes(app: FastifyInstance, service: ForgeLoopServ
       statement?: string;
       constraints?: Array<{ key: string; op: string; value: string; unit?: string }>;
       frozen?: boolean;
+      scenario?: 'PRODUCT' | 'RESEARCH' | 'HARDWARE';
+      collab_stage?: 'DRAFT' | 'EXPLORING' | 'VALIDATING' | 'COMMITTED';
     };
   }>('/v1/forge/intents/:intentId', {
     schema: {
       operationId: 'updateForgeIntent',
-      summary: 'Edit statement/constraints or freeze/unfreeze intent card (G1)',
+      summary: 'Edit statement/constraints, freeze, scenario, or collab stage (G1/V1)',
       tags: ['InnoForge'],
       headers,
       params: { type: 'object', required: ['intentId'], properties: { intentId: id } },
@@ -297,6 +302,11 @@ export function registerForgeRoutes(app: FastifyInstance, service: ForgeLoopServ
           statement: { type: 'string', minLength: 1, maxLength: 8000 },
           constraints: { type: 'array', maxItems: 32, items: constraintItem },
           frozen: { type: 'boolean' },
+          scenario: { type: 'string', enum: ['PRODUCT', 'RESEARCH', 'HARDWARE'] },
+          collab_stage: {
+            type: 'string',
+            enum: ['DRAFT', 'EXPLORING', 'VALIDATING', 'COMMITTED'],
+          },
         },
       },
       response: {
@@ -314,12 +324,186 @@ export function registerForgeRoutes(app: FastifyInstance, service: ForgeLoopServ
         ...(request.body.statement !== undefined ? { statement: request.body.statement } : {}),
         ...(request.body.constraints !== undefined ? { constraints: request.body.constraints } : {}),
         ...(request.body.frozen !== undefined ? { frozen: request.body.frozen } : {}),
+        ...(request.body.scenario !== undefined ? { scenario: request.body.scenario } : {}),
+        ...(request.body.collab_stage !== undefined ? { collabStage: request.body.collab_stage } : {}),
         audit: audit(request),
       }));
     } catch (error) {
       return fail(request, reply, error);
     }
   });
+
+  app.get<{
+    Headers: Pick<Headers, 'x-actor-id' | 'x-tenant-id'>;
+    Params: { intentId: string };
+  }>('/v1/forge/intents/:intentId/tree', {
+    schema: {
+      operationId: 'getForgeIntentTree',
+      summary: 'Get intent tree (V1)',
+      tags: ['InnoForge'],
+      headers: readHeaders,
+      params: { type: 'object', required: ['intentId'], properties: { intentId: id } },
+      response: { 200: response, 404: errorResponse },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.send({
+        tree: await service.getIntentTree({
+          intentId: request.params.intentId,
+          tenantId: request.headers['x-tenant-id'],
+        }),
+      });
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
+  app.put<{
+    Headers: Headers;
+    Params: { intentId: string };
+    Body: { nodes: unknown[]; updatedAt?: string };
+  }>('/v1/forge/intents/:intentId/tree', {
+    schema: {
+      operationId: 'replaceForgeIntentTree',
+      summary: 'Replace intent tree document (V1)',
+      tags: ['InnoForge'],
+      headers,
+      params: { type: 'object', required: ['intentId'], properties: { intentId: id } },
+      body: {
+        type: 'object',
+        additionalProperties: true,
+        required: ['nodes'],
+        properties: {
+          nodes: { type: 'array', maxItems: 200 },
+          updatedAt: { type: 'string' },
+        },
+      },
+      response: {
+        200: response,
+        403: errorResponse,
+        404: errorResponse,
+        409: errorResponse,
+        500: errorResponse,
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.send({
+        tree: await service.replaceIntentTree({
+          intentId: request.params.intentId,
+          tree: request.body,
+          audit: audit(request),
+        }),
+      });
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
+  app.post<{
+    Headers: Headers;
+    Params: { intentId: string };
+    Body: { parent_id?: string | null; kind: string; title: string };
+  }>('/v1/forge/intents/:intentId/tree/nodes', {
+    schema: {
+      operationId: 'addForgeTreeNode',
+      summary: 'Add a node to the intent tree (V1)',
+      tags: ['InnoForge'],
+      headers,
+      params: { type: 'object', required: ['intentId'], properties: { intentId: id } },
+      body: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['kind', 'title'],
+        properties: {
+          parent_id: { type: ['string', 'null'], maxLength: 512 },
+          kind: { type: 'string', enum: ['GOAL', 'CONSTRAINT', 'SUCCESS', 'BRANCH'] },
+          title: { type: 'string', minLength: 1, maxLength: 500 },
+        },
+      },
+      response: {
+        201: response,
+        403: errorResponse,
+        404: errorResponse,
+        409: errorResponse,
+        500: errorResponse,
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.code(201).send({
+        tree: await service.addTreeNode({
+          intentId: request.params.intentId,
+          ...(request.body.parent_id !== undefined ? { parentId: request.body.parent_id } : {}),
+          kind: request.body.kind,
+          title: request.body.title,
+          audit: audit(request),
+        }),
+      });
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
+  app.patch<{
+    Headers: Headers;
+    Params: { intentId: string; nodeId: string };
+    Body: { title?: string; status?: string };
+  }>('/v1/forge/intents/:intentId/tree/nodes/:nodeId', {
+    schema: {
+      operationId: 'updateForgeTreeNode',
+      summary: 'Update intent tree node title/status (V1)',
+      tags: ['InnoForge'],
+      headers,
+      params: {
+        type: 'object',
+        required: ['intentId', 'nodeId'],
+        properties: { intentId: id, nodeId: id },
+      },
+      body: {
+        type: 'object',
+        additionalProperties: false,
+        minProperties: 1,
+        properties: {
+          title: { type: 'string', minLength: 1, maxLength: 500 },
+          status: { type: 'string', enum: ['OPEN', 'ALIGNED', 'CONFLICT', 'DONE'] },
+        },
+      },
+      response: {
+        200: response,
+        403: errorResponse,
+        404: errorResponse,
+        409: errorResponse,
+        500: errorResponse,
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.send({
+        tree: await service.updateTreeNode({
+          intentId: request.params.intentId,
+          nodeId: request.params.nodeId,
+          ...(request.body.title !== undefined ? { title: request.body.title } : {}),
+          ...(request.body.status !== undefined ? { status: request.body.status } : {}),
+          audit: audit(request),
+        }),
+      });
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
+  app.get('/v1/forge/scenario-modes', {
+    schema: {
+      operationId: 'listForgeScenarioModes',
+      summary: 'List Product/Research/Hardware scenario modes (V1)',
+      tags: ['InnoForge'],
+      response: { 200: response },
+    },
+  }, async () => ({
+    scenarios: ['PRODUCT', 'RESEARCH', 'HARDWARE'],
+    collabStages: ['DRAFT', 'EXPLORING', 'VALIDATING', 'COMMITTED'],
+  }));
 
   app.get('/v1/forge/variant-candidates', {
     schema: {

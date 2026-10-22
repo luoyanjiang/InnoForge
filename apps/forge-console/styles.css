@@ -460,6 +460,32 @@ button { cursor: pointer; border: 0; }
 .memory-row .btn-row {
   flex-shrink: 0;
 }
+.scenario-switch {
+  margin-bottom: 0.85rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--line);
+}
+.scenario-row {
+  flex-wrap: wrap;
+  margin-top: 0.35rem;
+}
+.scenario-btn {
+  font-size: 0.72rem;
+  padding: 0.28rem 0.55rem;
+}
+.collab-stage-rail {
+  margin: 0.65rem 0 0.85rem;
+}
+.tree-node {
+  margin-bottom: 0.45rem;
+}
+.tree-node .list-row {
+  align-items: flex-start;
+}
+#tree-node-title {
+  flex: 1;
+  min-width: 10rem;
+}
 .tabs { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.85rem; }
 .tab {
   background: transparent;
