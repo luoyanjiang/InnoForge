@@ -798,3 +798,30 @@ button { cursor: pointer; border: 0; }
   .topbar, .content { padding-left: 3.25rem; }
   .scene-3d { height: 220px; }
 }
+
+/* Studio: let the workbench speak — collapse instructional shell chrome */
+body.studio-mode .topbar .eyebrow,
+body.studio-mode .topbar .page-sub,
+body.studio-mode .topbar .status-chip { display: none; }
+body.studio-mode .topbar {
+  padding: 0.65rem 1.25rem 0;
+  min-height: 0;
+}
+body.studio-mode .page-title {
+  font-size: 1.05rem;
+  font-family: var(--font);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--muted);
+}
+body.studio-mode .content {
+  padding: 0.5rem 1rem 1.25rem;
+  animation: none;
+}
+body.studio-mode .studio-host {
+  max-width: 1140px;
+  margin: 0 auto;
+}
+body.studio-mode .studio-host #forge-workflow {
+  width: 100%;
+}
