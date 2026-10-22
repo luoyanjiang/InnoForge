@@ -27,7 +27,7 @@ Context Store 链接在手机上不便下载时，请用本仓公开副本：
 
 | 用途 | URL |
 |------|-----|
-| **ZIP 下载（推荐）** | https://github.com/luoyanjiang/InnoForge/releases/download/product-docs-2026-10-22/InnoForge-%E4%BA%A7%E5%93%81%E6%96%87%E6%A1%A3-20261022.zip |
+| **ZIP 下载（推荐）** | https://github.com/luoyanjiang/InnoForge/releases/download/product-docs-2026-10-22/InnoForge-product-docs-20261022.zip |
 | Release 页 | https://github.com/luoyanjiang/InnoForge/releases/tag/product-docs-2026-10-22 |
 | **合集 Markdown** | https://github.com/luoyanjiang/InnoForge/blob/main/docs/product/innoforge-product-docs-pack.md |
 | 合集 raw | https://raw.githubusercontent.com/luoyanjiang/InnoForge/main/docs/product/innoforge-product-docs-pack.md |
