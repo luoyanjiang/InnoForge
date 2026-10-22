@@ -23,10 +23,23 @@ import {
   type ForgePxnPath,
 } from './pxn-bridge.js';
 import { buildTimeline, type ForgeTimelineItem } from './forge-timeline.js';
+import {
+  allocationAmountsByPrincipal,
+  computeCreditAllocations,
+  DEFAULT_ALLOCATION_WEIGHTS,
+  type ForgeAllocationWeights,
+  type ForgeCreditAllocation,
+} from './forge-allocations.js';
 
 export type { ForgeConstraint } from './forge-constraints.js';
 export type { ForgeJudgment, ForgeJudgmentAction, ForgeVariantCandidate } from './forge-judgments.js';
 export type { ForgeTimelineItem, ForgeTimelineKind } from './forge-timeline.js';
+export type {
+  ForgeAllocationRole,
+  ForgeAllocationWeights,
+  ForgeCreditAllocation,
+} from './forge-allocations.js';
+export { DEFAULT_ALLOCATION_WEIGHTS } from './forge-allocations.js';
 
 export type ForgeLoopStatus =
   | 'DRAFT'
@@ -122,6 +135,11 @@ export interface ForgeLoopService {
     tenantId: string;
     intentId?: string;
   }): Promise<readonly ForgeTimelineItem[]>;
+  getAllocationWeights(): Promise<ForgeAllocationWeights>;
+  listAllocations(input: {
+    intentId: string;
+    tenantId: string;
+  }): Promise<readonly ForgeCreditAllocation[]>;
 }
 
 export class ForgeLoopError extends Error {
@@ -152,6 +170,7 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
   private readonly accounts = new Map<string, MutableAccount>();
   private readonly intents = new Map<string, MutableIntent>();
   private readonly judgments = new Map<string, ForgeJudgment>();
+  private readonly allocations = new Map<string, ForgeCreditAllocation[]>();
   private readonly bridge: ForgePxnBridge;
 
   constructor(
@@ -159,6 +178,52 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
     bridge?: ForgePxnBridge,
   ) {
     this.bridge = bridge ?? new InMemoryForgePxnBridge();
+  }
+
+  private resolveConfirmer(intent: ForgeIntent): string {
+    const confirmed = [...intent.events].reverse().find((item) => item.type === 'forge.intent.confirmed');
+    return confirmed?.actorId ?? intent.principalId;
+  }
+
+  private async settleAllocations(input: {
+    intent: ForgeIntent;
+    minted: number;
+    occurredAt: string;
+  }): Promise<readonly ForgeCreditAllocation[]> {
+    const judgments = await this.listJudgments({
+      intentId: input.intent.id,
+      tenantId: input.intent.tenantId,
+    });
+    const suggesterIds = judgments
+      .filter((item) => item.action === 'ADOPT')
+      .map((item) => item.actorId);
+    const allocations = computeCreditAllocations({
+      intentId: input.intent.id,
+      tenantId: input.intent.tenantId,
+      minted: input.minted,
+      proposerId: input.intent.principalId,
+      suggesterIds,
+      confirmerId: this.resolveConfirmer(input.intent),
+      occurredAt: input.occurredAt,
+    });
+    const byPrincipal = allocationAmountsByPrincipal(allocations);
+    // Unstake from proposer; credit each recipient their share of minted.
+    const proposerKey = this.accountKey(input.intent.tenantId, input.intent.principalId);
+    const proposerAccount = this.accounts.get(proposerKey);
+    if (!proposerAccount) throw new ForgeLoopError('ACCOUNT_NOT_FOUND');
+    proposerAccount.staked -= input.intent.stake;
+    for (const [principalId, amount] of byPrincipal) {
+      await this.ensureAccount({
+        tenantId: input.intent.tenantId,
+        principalId,
+        openingBalance: 0,
+      });
+      const account = this.accounts.get(this.accountKey(input.intent.tenantId, principalId));
+      if (!account) throw new ForgeLoopError('ACCOUNT_NOT_FOUND');
+      account.balance += amount;
+    }
+    this.allocations.set(input.intent.id, [...allocations]);
+    return allocations;
   }
 
   private accountKey(tenantId: string, principalId: string): string {
@@ -484,17 +549,28 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
       });
       return record.view;
     }
-    // Simulated value realization: return stake + 50% reward to confirmer path principal.
+    // Simulated value realization: mint 1.5× stake, split by G4 attribution roles.
     const minted = Math.round(record.view.stake * 1.5);
-    const mutable = this.accounts.get(this.accountKey(record.view.tenantId, record.view.principalId));
-    if (!mutable) throw new ForgeLoopError('ACCOUNT_NOT_FOUND');
-    mutable.staked -= record.view.stake;
-    mutable.balance += minted;
+    const allocations = await this.settleAllocations({
+      intent: record.view,
+      minted,
+      occurredAt: input.audit.occurredAt,
+    });
+    const proposer = await this.getAccount({
+      tenantId: record.view.tenantId,
+      principalId: record.view.principalId,
+    });
     const settleEvent = event('forge.credit.settled', input.audit, {
       minted,
       stakeReturnedAs: record.view.stake,
       reward: minted - record.view.stake,
-      balanceAfter: mutable.balance,
+      balanceAfter: proposer?.balance ?? null,
+      allocations: allocations.map((item) => ({
+        role: item.role,
+        principalId: item.principalId,
+        amount: item.amount,
+        weightPercent: item.weightPercent,
+      })),
       pxnAcceptanceId: pxnPath.acceptanceId ?? null,
       pxnTaskState: pxnPath.taskState ?? null,
     });
@@ -618,6 +694,19 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
       );
     }
     return buildTimeline({ intents, judgments });
+  }
+
+  async getAllocationWeights(): Promise<ForgeAllocationWeights> {
+    return DEFAULT_ALLOCATION_WEIGHTS;
+  }
+
+  async listAllocations(input: {
+    intentId: string;
+    tenantId: string;
+  }): Promise<readonly ForgeCreditAllocation[]> {
+    const intent = await this.get({ id: input.intentId, tenantId: input.tenantId });
+    if (!intent) throw new ForgeLoopError('INTENT_NOT_FOUND');
+    return Object.freeze([...(this.allocations.get(input.intentId) ?? [])]);
   }
 }
 

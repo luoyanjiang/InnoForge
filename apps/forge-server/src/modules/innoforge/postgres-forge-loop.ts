@@ -28,6 +28,9 @@ import {
   type ForgeLoopService,
   type ForgeLoopStatus,
   type ForgeTimelineItem,
+  type ForgeCreditAllocation,
+  type ForgeAllocationWeights,
+  DEFAULT_ALLOCATION_WEIGHTS,
 } from './forge-loop.js';
 import {
   createPxnBridge,
@@ -35,6 +38,11 @@ import {
   type ForgePxnPath,
 } from './pxn-bridge.js';
 import { buildTimeline } from './forge-timeline.js';
+import {
+  allocationAmountsByPrincipal,
+  computeCreditAllocations,
+  type ForgeAllocationRole,
+} from './forge-allocations.js';
 
 type JudgmentRow = {
   id: string;
@@ -432,6 +440,26 @@ export class PostgresForgeLoopService implements ForgeLoopService {
       audit: input.audit,
     });
 
+    const minted = willSettle ? Math.round(current.stake * 1.5) : 0;
+    let allocations: readonly ForgeCreditAllocation[] = [];
+    if (willSettle) {
+      const judgments = await this.listJudgments({
+        intentId: current.id,
+        tenantId: current.tenantId,
+      });
+      const confirmed = [...current.events].reverse()
+        .find((item) => item.type === 'forge.intent.confirmed');
+      allocations = computeCreditAllocations({
+        intentId: current.id,
+        tenantId: current.tenantId,
+        minted,
+        proposerId: current.principalId,
+        suggesterIds: judgments.filter((item) => item.action === 'ADOPT').map((item) => item.actorId),
+        confirmerId: confirmed?.actorId ?? current.principalId,
+        occurredAt: input.audit.occurredAt,
+      });
+    }
+
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
@@ -451,13 +479,40 @@ export class PostgresForgeLoopService implements ForgeLoopService {
         await client.query('COMMIT');
         return this.requireIntent(input.id, input.audit.tenantId);
       }
-      const minted = Math.round(current.stake * 1.5);
       await client.query(
         `UPDATE forge_credit_accounts
-            SET staked = staked - $3, balance = balance + $4, updated_at = $5::timestamptz
+            SET staked = staked - $3, updated_at = $4::timestamptz
           WHERE tenant_id=$1 AND principal_id=$2`,
-        [current.tenantId, current.principalId, current.stake, minted, input.audit.occurredAt],
+        [current.tenantId, current.principalId, current.stake, input.audit.occurredAt],
       );
+      const byPrincipal = allocationAmountsByPrincipal(allocations);
+      for (const [principalId, amount] of byPrincipal) {
+        await client.query(
+          `INSERT INTO forge_credit_accounts (tenant_id, principal_id, balance, staked, updated_at)
+           VALUES ($1,$2,$3,0,$4::timestamptz)
+           ON CONFLICT (tenant_id, principal_id) DO UPDATE
+             SET balance = forge_credit_accounts.balance + EXCLUDED.balance,
+                 updated_at = EXCLUDED.updated_at`,
+          [current.tenantId, principalId, amount, input.audit.occurredAt],
+        );
+      }
+      for (const allocation of allocations) {
+        await client.query(
+          `INSERT INTO forge_credit_allocations
+            (id, intent_id, tenant_id, principal_id, role, weight_percent, amount, occurred_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8::timestamptz)`,
+          [
+            allocation.id,
+            allocation.intentId,
+            allocation.tenantId,
+            allocation.principalId,
+            allocation.role,
+            allocation.weightPercent,
+            allocation.amount,
+            allocation.occurredAt,
+          ],
+        );
+      }
       await client.query(
         `UPDATE forge_intents
             SET status='SETTLED', deploy_job=$2::jsonb, credit_minted=$3,
@@ -469,6 +524,12 @@ export class PostgresForgeLoopService implements ForgeLoopService {
         minted,
         stakeReturnedAs: current.stake,
         reward: minted - current.stake,
+        allocations: allocations.map((item) => ({
+          role: item.role,
+          principalId: item.principalId,
+          amount: item.amount,
+          weightPercent: item.weightPercent,
+        })),
         pxnAcceptanceId: pxnPath.acceptanceId ?? null,
         pxnTaskState: pxnPath.taskState ?? null,
       };
@@ -562,6 +623,42 @@ export class PostgresForgeLoopService implements ForgeLoopService {
       );
     }
     return buildTimeline({ intents, judgments });
+  }
+
+  async getAllocationWeights(): Promise<ForgeAllocationWeights> {
+    return DEFAULT_ALLOCATION_WEIGHTS;
+  }
+
+  async listAllocations(input: {
+    intentId: string;
+    tenantId: string;
+  }): Promise<readonly ForgeCreditAllocation[]> {
+    await this.requireIntent(input.intentId, input.tenantId);
+    const result = await this.pool.query<{
+      id: string;
+      intent_id: string;
+      tenant_id: string;
+      principal_id: string;
+      role: ForgeAllocationRole;
+      weight_percent: string;
+      amount: string;
+      occurred_at: Date;
+    }>(
+      `SELECT * FROM forge_credit_allocations
+        WHERE intent_id=$1 AND tenant_id=$2
+        ORDER BY role, principal_id`,
+      [input.intentId, input.tenantId],
+    );
+    return result.rows.map((row) => Object.freeze({
+      id: row.id,
+      intentId: row.intent_id,
+      tenantId: row.tenant_id,
+      principalId: row.principal_id,
+      role: row.role,
+      weightPercent: Number(row.weight_percent),
+      amount: Number(row.amount),
+      occurredAt: new Date(row.occurred_at).toISOString(),
+    }));
   }
 
   async recordJudgment(input: {
