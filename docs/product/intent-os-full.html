@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Intent OS · 完整原型</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  body { font-family: 'Inter', system-ui, sans-serif; background: #0a0e17; color: #e2e8f0; }
+  .panel { background: #111827ee; border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; }
+  .nav-item.active { background: rgba(255,255,255,0.08); color: #22d3ee; }
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-thumb { background: #334155; }
+</style>
+</head>
+<body class="h-screen overflow-hidden text-sm">
+<div class="flex h-full">
+  <aside class="w-60 bg-[#0f172a] border-r border-white/10 flex flex-col">
+    <div class="p-4 border-b border-white/10 flex items-center gap-2">
+      <div class="w-7 h-7 bg-cyan-500 rounded flex items-center justify-center text-xs font-bold text-black">◈</div>
+      <div class="font-semibold">Intent OS</div>
+    </div>
+    <nav class="p-3 space-y-1 text-xs flex-1" id="nav">
+      <div class="nav-item px-3 py-2 rounded-lg cursor-pointer" data-page="dashboard">个人总览</div>
+      <div class="nav-item px-3 py-2 rounded-lg cursor-pointer active" data-page="twin">项目孪生</div>
+      <div class="nav-item px-3 py-2 rounded-lg cursor-pointer" data-page="equity">贡献与权益</div>
+      <div class="nav-item px-3 py-2 rounded-lg cursor-pointer" data-page="history">意图与判断历史</div>
+      <div class="nav-item px-3 py-2 rounded-lg cursor-pointer" data-page="discover">发现项目</div>
+      <div class="nav-item px-3 py-2 rounded-lg cursor-pointer" data-page="create">创建意图</div>
+      <div class="nav-item px-3 py-2 rounded-lg cursor-pointer" data-page="dispatch">确认调度</div>
+      <div class="nav-item px-3 py-2 rounded-lg cursor-pointer" data-page="realized">价值兑现</div>
+    </nav>
+    <div class="p-4 border-t border-white/10 text-xs">
+      <div class="flex justify-between"><span class="text-gray-500">Credit</span><span class="text-cyan-400">12,450</span></div>
+    </div>
+  </aside>
+  <main class="flex-1 overflow-auto" id="content"></main>
+</div>
+
+<script>
+const pages = {
+  dashboard: `
+    <div class="p-6">
+      <div class="flex justify-between items-center mb-6">
+        <div><div class="text-xs text-gray-500">PERSONAL DASHBOARD</div><h1 class="text-2xl font-semibold">Welcome back, Alex.</h1></div>
+        <div class="text-xs text-emerald-400">System Status: Nominal</div>
+      </div>
+      <div class="grid grid-cols-3 gap-4 mb-6">
+        <div class="panel p-5"><div class="text-xs text-gray-500">Active Intents</div><div class="text-xl mt-1">3 Active</div></div>
+        <div class="panel p-5"><div class="text-xs text-gray-500">Credit Balance</div><div class="text-3xl text-cyan-400 font-semibold">12,450</div><div class="text-xs text-gray-500 mt-1">Staked 28,750</div></div>
+        <div class="panel p-5"><div class="text-xs text-gray-500">Judgment Reputation</div><div class="text-3xl font-semibold">842</div><div class="text-xs text-emerald-400">Top 8.7%</div></div>
+      </div>
+      <div class="panel p-5">
+        <div class="font-medium mb-3">Ongoing Projects</div>
+        <div class="space-y-2 text-xs">
+          <div class="flex justify-between"><span>Veritas Research Hub</span><span>Equity 2.40%</span></div>
+          <div class="flex justify-between"><span>Intent Guardrails</span><span>Equity 1.75%</span></div>
+          <div class="flex justify-between"><span>Intent SDK</span><span>Equity 3.20%</span></div>
+        </div>
+      </div>
+    </div>`,
+
+  twin: `
+    <div class="h-full flex flex-col">
+      <header class="h-14 border-b border-white/10 flex items-center justify-between px-6">
+        <div>Intent OS <span class="text-gray-600">|</span> Project Space</div>
+        <div class="flex gap-3 text-xs"><span class="px-3 py-1 bg-[#1e293b] rounded-full">Version 0.4.2</span><span class="px-3 py-1 bg-purple-900/40 text-purple-300 rounded-full">Credit Stake 12,450</span></div>
+      </header>
+      <div class="flex-1 grid grid-cols-12 gap-4 p-4">
+        <div class="col-span-3 panel p-4 overflow-auto">
+          <div class="text-cyan-400 font-medium mb-2">Intent & Constraints</div>
+          <div class="text-xs text-gray-500 mb-3">Guiding principles and boundaries</div>
+          <div class="text-xs text-gray-500">INTENT</div>
+          <p class="text-sm my-2">Design a modular, adaptive product system that optimizes for resilience, circularity and human-centric interaction.</p>
+          <div class="text-xs text-gray-500 mt-3">CONSTRAINTS</div>
+          <div class="text-xs mt-1 space-y-1"><div>Mass ≤ 18 kg</div><div>Cost ≤ $320/unit</div></div>
+        </div>
+        <div class="col-span-6 panel p-4 flex items-center justify-center">
+          <div class="text-center"><div class="text-7xl text-cyan-400/60 mb-2">▣</div><div>Living Digital Twin</div><div class="text-xs text-gray-500">Real-time model</div></div>
+        </div>
+        <div class="col-span-3 panel p-4">
+          <div class="font-medium mb-2">Agent Candidates <span class="text-xs text-cyan-400">3 New</span></div>
+          <div class="bg-[#1e293b] p-3 rounded-xl text-xs">
+            <div class="text-cyan-300 mb-1">Agent α · Modularity · High Impact</div>
+            <div class="text-gray-400 mb-2">Proposes adaptive joint system...</div>
+            <div class="flex gap-2"><button onclick="alert('已采纳')" class="flex-1 py-1 bg-cyan-600 rounded">Adopt</button><button class="flex-1 py-1 bg-white/10 rounded">Reject</button></div>
+          </div>
+        </div>
+      </div>
+    </div>`,
+
+  equity: `
+    <div class="p-6">
+      <h1 class="text-xl font-semibold mb-1">JUDGMENT CONTRIBUTION & CREDIT EQUITY</h1>
+      <p class="text-xs text-gray-500 mb-6">Transparent contribution. Verifiable impact.</p>
+      <div class="grid grid-cols-3 gap-4 mb-4">
+        <div class="panel p-4"><div class="text-xs">INTENT PROPOSER</div><div class="text-2xl mt-1">38.5%</div></div>
+        <div class="panel p-4"><div class="text-xs">KEY SUGGESTER</div><div class="text-2xl mt-1">32.0%</div></div>
+        <div class="panel p-4"><div class="text-xs">CONFIRMER</div><div class="text-2xl mt-1">29.5%</div></div>
+      </div>
+      <div class="panel p-4 text-xs text-gray-400">Your staked Credit: 2,850 · Potential allocation based on verified impact.</div>
+    </div>`,
+
+  history: `
+    <div class="p-6">
+      <h1 class="text-xl font-semibold mb-4">Intent History & Judgment Timeline</h1>
+      <div class="space-y-3">
+        <div class="panel p-4 text-xs"><div class="text-purple-400">PROJECT INITIATION</div><div class="mt-1">Intent Established · A. Chen · Mar 12, 2024</div></div>
+        <div class="panel p-4 text-xs"><div class="text-cyan-400">ARCHITECTURE DECISION</div><div class="mt-1">Core Platform Selected · Apr 03, 2024</div></div>
+        <div class="panel p-4 text-xs"><div class="text-emerald-400">DATA STRATEGY</div><div class="mt-1">Data Granularity Defined · May 21, 2024</div></div>
+      </div>
+    </div>`,
+
+  discover: `
+    <div class="p-6">
+      <h1 class="text-xl font-semibold mb-1">Discover Projects</h1>
+      <p class="text-xs text-gray-500 mb-4">Living digital twin projects seeking asynchronous judgment.</p>
+      <div class="space-y-3">
+        <div class="panel p-4 flex justify-between items-center text-xs">
+          <div><div class="font-medium">UrbanTwin: Mobility & Infrastructure</div><div class="text-gray-500">Validate traffic optimization model</div></div>
+          <div class="text-right"><div class="text-purple-400">75 Credit</div><div>0.018% – 0.028%</div></div>
+        </div>
+        <div class="panel p-4 flex justify-between items-center text-xs">
+          <div><div class="font-medium">GridTwin: Renewable Integration</div><div class="text-gray-500">Battery dispatch strategy</div></div>
+          <div class="text-right"><div class="text-emerald-400">120 Credit</div><div>0.025% – 0.040%</div></div>
+        </div>
+      </div>
+    </div>`,
+
+  create: `
+    <div class="p-6 max-w-3xl">
+      <h1 class="text-xl font-semibold mb-4">Define Intent</h1>
+      <div class="panel p-5 space-y-4 text-xs">
+        <div><div class="text-gray-500 mb-1">INTENT STATEMENT</div><div class="bg-white/5 p-3 rounded">Increase my stablecoin yield while keeping risk low...</div></div>
+        <div><div class="text-gray-500">REQUIRED CREDIT STAKE</div><div class="text-3xl text-cyan-400 font-semibold">750 CTC</div></div>
+        <button onclick="alert('意图已创建并完成质押')" class="px-6 py-2.5 bg-cyan-600 rounded-lg">Continue to Review & Stake</button>
+      </div>
+    </div>`,
+
+  dispatch: `
+    <div class="p-6">
+      <h1 class="text-xl font-semibold mb-4">DISPATCH CONFIRMATION</h1>
+      <div class="grid grid-cols-2 gap-4">
+        <div class="panel p-4 text-xs"><div class="text-cyan-400 mb-2">1 AGENT PROPOSAL</div><div>Locked Twin Version: TWIN v2.7.4-L</div></div>
+        <div class="panel p-4 text-xs border-amber-500/30"><div class="text-amber-400 mb-2">2 HUMAN CONFIRMATION</div><div>Stake Requirement: 5.00 PEN Credits</div><button onclick="alert('已确认并调度')" class="mt-3 px-4 py-2 bg-amber-600 rounded">CONFIRM & DISPATCH</button></div>
+      </div>
+    </div>`,
+
+  realized: `
+    <div class="p-6">
+      <div class="flex justify-between items-center mb-4"><h1 class="text-xl font-semibold text-emerald-400">VALUE REALIZED</h1><div class="text-xs text-emerald-400">REALIZATION CONFIRMED</div></div>
+      <div class="panel p-5 mb-4"><div class="text-xs text-gray-500">CREDIT MINTED</div><div class="text-4xl text-emerald-400 font-semibold">2,850.00</div></div>
+      <div class="grid grid-cols-3 gap-3 text-xs">
+        <div class="panel p-3"><div>INTENT PROPOSER</div><div class="text-xl mt-1">1,140</div></div>
+        <div class="panel p-3"><div>SUGGESTERS</div><div class="text-xl mt-1">855</div></div>
+        <div class="panel p-3"><div>CONFIRMERS</div><div class="text-xl mt-1">855</div></div>
+      </div>
+    </div>`
+};
+
+function render(page) {
+  document.getElementById('content').innerHTML = pages[page] || pages.twin;
+  document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+  document.querySelector(`.nav-item[data-page="${page}"]`)?.classList.add('active');
+}
+
+document.getElementById('nav').addEventListener('click', e => {
+  const item = e.target.closest('.nav-item');
+  if (item) render(item.dataset.page);
+});
+
+render('twin');
+</script>
+</body>
+</html>
