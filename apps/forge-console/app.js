@@ -36,6 +36,8 @@ const state = {
   lifeforms: [],
   selectedLifeformId: localStorage.getItem('forge.lifeform') || null,
   lumenLog: [],
+  memories: [],
+  memoryModalOpen: false,
   marketOwned: JSON.parse(localStorage.getItem('forge.market') || 'false'),
   connFilter: 'all',
   partnerConfig: null,
@@ -419,15 +421,23 @@ function renderWorkbench() {
   }).join('')}
       </div>
       <div class="panel chat">
-        <div style="display:flex;justify-content:space-between"><h3>${tt('lumen')}</h3><span class="badge cyan">${tt('memory')}</span></div>
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:0.5rem">
+          <h3>${tt('lumen')}</h3>
+          <div class="btn-row">
+            <button type="button" class="btn btn-ghost" id="memory-open">${tt('memoryManage')}</button>
+            <span class="badge cyan">${tt('memory')}</span>
+          </div>
+        </div>
         <div class="stat-sub">${tt('lumenRole')}</div>
         <div class="bubble">${tt('lumenHello')}</div>
         ${state.lumenLog.map((m) => `<div class="bubble">${m}</div>`).join('')}
         <div class="field" style="margin:0"><textarea id="lumen-input" placeholder="${tt('lumenPlaceholder')}"></textarea></div>
         <button type="button" class="btn btn-primary" id="lumen-send">${tt('sendLumen')}</button>
       </div>
-    </div>`;
+    </div>
+    ${state.memoryModalOpen ? memoryModalHtml() : ''}`;
   if (editing) bindConstraintEditor('wb');
+  bindMemoryModal(intent);
   el('wb-edit')?.addEventListener('click', () => {
     state.editingIntent = intent.id;
     renderWorkbench();
@@ -493,15 +503,116 @@ function renderWorkbench() {
     toast(tt('judgmentsRefreshed'));
     renderWorkbench();
   });
-  el('lumen-send')?.addEventListener('click', () => {
-    const text = el('lumen-input').value.trim();
-    if (!text) return;
-    state.lumenLog.push(text);
-    state.lumenLog.push(state.locale === 'zh'
-      ? `已记录偏好，并关联到意图约束。`
-      : `Preference recorded and linked to intent constraints.`);
+  el('memory-open')?.addEventListener('click', async () => {
+    if (!intent) return toast(tt('memoryNeedIntent'));
+    state.memoryModalOpen = true;
+    await refreshMemories(intent.id);
     renderWorkbench();
   });
+  el('lumen-send')?.addEventListener('click', async () => {
+    const text = el('lumen-input').value.trim();
+    if (!text) return;
+    if (!intent) return toast(tt('memoryNeedIntent'));
+    try {
+      const memory = await api('POST', `/v1/forge/intents/${encodeURIComponent(intent.id)}/memories`, {
+        body: { text },
+        idempotencyKey: `mem:${intent.id}:${Date.now()}`,
+      });
+      state.lumenLog.push(text);
+      state.lumenLog.push(tt('memoryEcho').replace('{id}', memory.id.slice(0, 18)));
+      await refreshMemories(intent.id);
+      await refreshIntents();
+      toast(tt('memoryCreated'));
+      renderWorkbench();
+    } catch (error) { toast(error.message); }
+  });
+}
+
+function memoryStatusLabel(status) {
+  if (status === 'FORGOTTEN') return tt('memoryForgotten');
+  if (status === 'PROMOTED') return tt('memoryPromoted');
+  return tt('memoryActive');
+}
+
+async function refreshMemories(intentId) {
+  if (!intentId) {
+    state.memories = [];
+    return;
+  }
+  try {
+    const data = await api('GET', `/v1/forge/intents/${encodeURIComponent(intentId)}/memories`);
+    state.memories = data.memories || [];
+  } catch {
+    state.memories = [];
+  }
+}
+
+function memoryModalHtml() {
+  const memories = state.memories || [];
+  return `
+    <div class="modal-backdrop" id="memory-backdrop">
+      <div class="modal-panel" id="memory-modal" role="dialog" aria-modal="true">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:0.75rem">
+          <h3>${tt('memoryModalTitle')}</h3>
+          <button type="button" class="btn btn-ghost" id="memory-close">${tt('memoryClose')}</button>
+        </div>
+        <p class="empty">${tt('memoryModalHint')}</p>
+        <div id="memory-list">
+          ${memories.length ? memories.map((m) => `
+            <div class="list-row memory-row">
+              <div>
+                <div>${escapeAttr(m.text)}</div>
+                <div class="stat-sub">
+                  ${memoryStatusLabel(m.status)}
+                  ${m.consensus ? ` · ${tt('memoryConsensus')}` : ''}
+                  · <span class="mono">${escapeAttr(m.id.slice(0, 18))}</span>
+                </div>
+              </div>
+              <div class="btn-row">
+                <button type="button" class="btn btn-warn" data-forget="${escapeAttr(m.id)}" ${m.status !== 'ACTIVE' ? 'disabled' : ''}>${tt('memoryForget')}</button>
+                <button type="button" class="btn btn-cyan" data-promote="${escapeAttr(m.id)}" ${m.status !== 'ACTIVE' ? 'disabled' : ''}>${tt('memoryPromote')}</button>
+              </div>
+            </div>`).join('') : `<p class="empty">${tt('memoryEmpty')}</p>`}
+        </div>
+      </div>
+    </div>`;
+}
+
+function bindMemoryModal(intent) {
+  el('memory-close')?.addEventListener('click', () => {
+    state.memoryModalOpen = false;
+    renderWorkbench();
+  });
+  el('memory-backdrop')?.addEventListener('click', (event) => {
+    if (event.target === el('memory-backdrop')) {
+      state.memoryModalOpen = false;
+      renderWorkbench();
+    }
+  });
+  el('content')?.querySelectorAll('[data-forget]').forEach((btn) => btn.addEventListener('click', async () => {
+    if (!intent) return;
+    try {
+      await api('DELETE', `/v1/forge/intents/${encodeURIComponent(intent.id)}/memories/${encodeURIComponent(btn.dataset.forget)}`, {
+        idempotencyKey: `mem-forget:${btn.dataset.forget}`,
+      });
+      await refreshMemories(intent.id);
+      toast(tt('memoryForgetOk'));
+      renderWorkbench();
+    } catch (error) { toast(error.message); }
+  }));
+  el('content')?.querySelectorAll('[data-promote]').forEach((btn) => btn.addEventListener('click', async () => {
+    if (!intent) return;
+    try {
+      await api('POST', `/v1/forge/intents/${encodeURIComponent(intent.id)}/memories/${encodeURIComponent(btn.dataset.promote)}/promote`, {
+        body: {},
+        idempotencyKey: `mem-promote:${btn.dataset.promote}`,
+      });
+      await refreshMemories(intent.id);
+      await refreshIntents();
+      toast(tt('memoryPromoteOk'));
+      renderWorkbench();
+    } catch (error) { toast(error.message); }
+  }));
 }
 
 function closeSse() {
@@ -1438,7 +1549,12 @@ function renderPage() {
     history: renderHistory,
   };
   if (state.page === 'workbench') {
-    void refreshVariantsAndJudgments().then(() => renderWorkbench());
+    void (async () => {
+      await refreshVariantsAndJudgments();
+      const intent = selectedIntent();
+      if (intent) await refreshMemories(intent.id);
+      renderWorkbench();
+    })();
     return;
   }
   if (state.page === 'history') {

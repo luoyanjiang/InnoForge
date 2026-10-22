@@ -712,6 +712,175 @@ export function registerForgeRoutes(app: FastifyInstance, service: ForgeLoopServ
     }
   });
 
+  app.get<{
+    Headers: Pick<Headers, 'x-actor-id' | 'x-tenant-id'>;
+    Params: { intentId: string };
+    Querystring: { includeForgotten?: string };
+  }>('/v1/forge/intents/:intentId/memories', {
+    schema: {
+      operationId: 'listForgeMemories',
+      summary: 'List Lumen memories for an intent (G8)',
+      tags: ['InnoForge'],
+      headers: readHeaders,
+      params: { type: 'object', required: ['intentId'], properties: { intentId: id } },
+      querystring: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { includeForgotten: { type: 'string', enum: ['1', 'true', '0', 'false'] } },
+      },
+      response: { 200: response, 404: errorResponse },
+    },
+  }, async (request, reply) => {
+    try {
+      const include = request.query.includeForgotten === '1'
+        || request.query.includeForgotten === 'true';
+      return reply.send({
+        memories: await service.listMemories({
+          intentId: request.params.intentId,
+          tenantId: request.headers['x-tenant-id'],
+          includeForgotten: include,
+        }),
+      });
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
+  app.get<{
+    Headers: Pick<Headers, 'x-actor-id' | 'x-tenant-id'>;
+    Params: { intentId: string; memoryId: string };
+  }>('/v1/forge/intents/:intentId/memories/:memoryId', {
+    schema: {
+      operationId: 'getForgeMemory',
+      summary: 'Get one Lumen memory (G8)',
+      tags: ['InnoForge'],
+      headers: readHeaders,
+      params: {
+        type: 'object',
+        required: ['intentId', 'memoryId'],
+        properties: { intentId: id, memoryId: id },
+      },
+      response: { 200: response, 404: errorResponse },
+    },
+  }, async (request, reply) => {
+    try {
+      const memory = await service.getMemory({
+        intentId: request.params.intentId,
+        memoryId: request.params.memoryId,
+        tenantId: request.headers['x-tenant-id'],
+      });
+      if (!memory) return fail(request, reply, new ForgeLoopError('MEMORY_NOT_FOUND'));
+      return reply.send(memory);
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
+  app.post<{
+    Headers: Headers;
+    Params: { intentId: string };
+    Body: { text: string };
+  }>('/v1/forge/intents/:intentId/memories', {
+    schema: {
+      operationId: 'createForgeMemory',
+      summary: 'Create a Lumen memory for an intent (G8)',
+      tags: ['InnoForge'],
+      headers,
+      params: { type: 'object', required: ['intentId'], properties: { intentId: id } },
+      body: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['text'],
+        properties: { text: { type: 'string', minLength: 1, maxLength: 2000 } },
+      },
+      response: {
+        201: response,
+        403: errorResponse,
+        404: errorResponse,
+        409: errorResponse,
+        500: errorResponse,
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.code(201).send(await service.createMemory({
+        intentId: request.params.intentId,
+        text: request.body.text,
+        audit: audit(request),
+      }));
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
+  app.delete<{
+    Headers: Headers;
+    Params: { intentId: string; memoryId: string };
+  }>('/v1/forge/intents/:intentId/memories/:memoryId', {
+    schema: {
+      operationId: 'forgetForgeMemory',
+      summary: 'Forget (soft-delete) a Lumen memory (G8)',
+      tags: ['InnoForge'],
+      headers,
+      params: {
+        type: 'object',
+        required: ['intentId', 'memoryId'],
+        properties: { intentId: id, memoryId: id },
+      },
+      response: {
+        200: response,
+        403: errorResponse,
+        404: errorResponse,
+        409: errorResponse,
+        500: errorResponse,
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.send(await service.forgetMemory({
+        intentId: request.params.intentId,
+        memoryId: request.params.memoryId,
+        audit: audit(request),
+      }));
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
+  app.post<{
+    Headers: Headers;
+    Params: { intentId: string; memoryId: string };
+  }>('/v1/forge/intents/:intentId/memories/:memoryId/promote', {
+    schema: {
+      operationId: 'promoteForgeMemory',
+      summary: 'Promote memory to consensus constraint + event (G8)',
+      tags: ['InnoForge'],
+      headers,
+      params: {
+        type: 'object',
+        required: ['intentId', 'memoryId'],
+        properties: { intentId: id, memoryId: id },
+      },
+      response: {
+        200: response,
+        403: errorResponse,
+        404: errorResponse,
+        409: errorResponse,
+        500: errorResponse,
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.send(await service.promoteMemory({
+        intentId: request.params.intentId,
+        memoryId: request.params.memoryId,
+        audit: audit(request),
+      }));
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
   app.post<{
     Headers: Headers;
     Params: { intentId: string };

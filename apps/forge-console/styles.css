@@ -433,6 +433,33 @@ button { cursor: pointer; border: 0; }
   background: rgba(0,0,0,0.45);
   z-index: 15;
 }
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(4, 10, 20, 0.72);
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+}
+.modal-panel {
+  width: min(36rem, 100%);
+  max-height: min(80vh, 40rem);
+  overflow: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 1rem 1.1rem 1.15rem;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.35);
+}
+.memory-row {
+  align-items: flex-start;
+  gap: 0.75rem;
+}
+.memory-row .btn-row {
+  flex-shrink: 0;
+}
 .tabs { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.85rem; }
 .tab {
   background: transparent;
