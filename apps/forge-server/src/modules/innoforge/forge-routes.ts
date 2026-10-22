@@ -48,7 +48,7 @@ function audit(request: FastifyRequest<{ Headers: Headers }>): ForgeAudit {
 async function fail(request: FastifyRequest, reply: FastifyReply, error: unknown) {
   const code = error instanceof ForgeLoopError || error instanceof ForgePxnBridgeError
     || (error instanceof Error && 'code' in error && typeof (error as { code: unknown }).code === 'string'
-      && /^(APPROVER_|TASK_|REQUESTER_|ACTIVE_|REVISION_|PXN_)/.test((error as { code: string }).code))
+      && /^(APPROVER_|TASK_|REQUESTER_|ACTIVE_|REVISION_|PXN_|WORKBENCH_)/.test((error as { code: string }).code))
     ? (error as { code: string }).code
     : 'INTERNAL_ERROR';
   if (code === 'INTERNAL_ERROR') request.log.error({ err: error }, 'innoforge loop failed');
@@ -84,6 +84,14 @@ export function registerForgeRoutes(app: FastifyInstance, service: ForgeLoopServ
   app.get('/forge/r3f-scenes.js', async (_request, reply) => {
     const js = readFileSync(join(consoleRoot(), 'r3f-scenes.js'), 'utf8');
     return reply.type('application/javascript; charset=utf-8').send(js);
+  });
+  app.get('/forge/workbench.js', async (_request, reply) => {
+    const js = readFileSync(join(consoleRoot(), 'workbench.js'), 'utf8');
+    return reply.type('application/javascript; charset=utf-8').send(js);
+  });
+  app.get('/forge/workbench.css', async (_request, reply) => {
+    const css = readFileSync(join(consoleRoot(), 'workbench.css'), 'utf8');
+    return reply.type('text/css; charset=utf-8').send(css);
   });
 
   app.get<{ Querystring: { locale?: string } }>('/v1/forge/i18n', {
@@ -633,6 +641,309 @@ export function registerForgeRoutes(app: FastifyInstance, service: ForgeLoopServ
         tenantId: request.headers['x-tenant-id'],
         ...(request.query.locale !== undefined ? { locale: request.query.locale } : {}),
       }));
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
+  const wbParams = {
+    type: 'object',
+    required: ['intentId'],
+    properties: { intentId: id },
+  } as const;
+
+  app.post<{
+    Headers: Headers;
+    Body: { intent_id?: string; lang?: 'zh' | 'en' };
+  }>('/v1/forge/workbench/ensure', {
+    schema: {
+      operationId: 'ensureForgeWorkbench',
+      summary: 'Ensure demo studio project + workbench state (v0.5 P0)',
+      tags: ['InnoForge'],
+      headers,
+      body: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          intent_id: id,
+          lang: { type: 'string', enum: ['zh', 'en'] },
+        },
+      },
+      response: { 200: response, 403: errorResponse, 409: errorResponse, 500: errorResponse },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.send(await service.ensureWorkbench({
+        ...(request.body.intent_id !== undefined ? { intentId: request.body.intent_id } : {}),
+        ...(request.body.lang !== undefined ? { lang: request.body.lang } : {}),
+        audit: audit(request),
+      }));
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
+  app.get<{
+    Headers: Pick<Headers, 'x-actor-id' | 'x-tenant-id'>;
+    Params: { intentId: string };
+  }>('/v1/forge/intents/:intentId/workbench', {
+    schema: {
+      operationId: 'getForgeWorkbench',
+      summary: 'Get validation workbench state (seeds demo if missing)',
+      tags: ['InnoForge'],
+      headers: readHeaders,
+      params: wbParams,
+      response: { 200: response, 404: errorResponse },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.send(await service.getWorkbench({
+        intentId: request.params.intentId,
+        tenantId: request.headers['x-tenant-id'],
+        audit: {
+          actorId: request.headers['x-actor-id'],
+          idempotencyKey: `wb-get:${request.id}`,
+          requestId: request.id,
+          occurredAt: new Date().toISOString(),
+          tenantId: request.headers['x-tenant-id'],
+        },
+      }));
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
+  app.patch<{
+    Headers: Headers;
+    Params: { intentId: string };
+    Body: Record<string, unknown>;
+  }>('/v1/forge/intents/:intentId/workbench', {
+    schema: {
+      operationId: 'patchForgeWorkbench',
+      summary: 'Patch workbench UI fields (req/pages/days/role/lang/stage/panel)',
+      tags: ['InnoForge'],
+      headers,
+      params: wbParams,
+      body: { type: 'object', additionalProperties: true },
+      response: { 200: response, 404: errorResponse, 409: errorResponse },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.send(await service.patchWorkbench({
+        intentId: request.params.intentId,
+        patch: request.body,
+        audit: audit(request),
+      }));
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
+  const wbWrite = (
+    path: string,
+    operationId: string,
+    summary: string,
+    handler: (
+      intentId: string,
+      body: Record<string, unknown>,
+      a: ReturnType<typeof audit>,
+    ) => Promise<unknown>,
+    bodySchema: Record<string, unknown> = { type: 'object', additionalProperties: false },
+  ) => {
+    app.post<{
+      Headers: Headers;
+      Params: { intentId: string };
+      Body: Record<string, unknown>;
+    }>(path, {
+      schema: {
+        operationId,
+        summary,
+        tags: ['InnoForge'],
+        headers,
+        params: wbParams,
+        body: bodySchema,
+        response: {
+          200: response,
+          403: errorResponse,
+          404: errorResponse,
+          409: errorResponse,
+          500: errorResponse,
+        },
+      },
+    }, async (request, reply) => {
+      try {
+        return reply.send(await handler(
+          request.params.intentId,
+          request.body ?? {},
+          audit(request),
+        ));
+      } catch (error) {
+        return fail(request, reply, error);
+      }
+    });
+  };
+
+  wbWrite(
+    '/v1/forge/intents/:intentId/workbench/accept',
+    'acceptForgeWorkbench',
+    'Accept contract: freeze R1 + create T-01 task',
+    (intentId, _body, a) => service.acceptWorkbench({ intentId, audit: a }),
+  );
+  wbWrite(
+    '/v1/forge/intents/:intentId/workbench/build',
+    'buildForgeWorkbench',
+    'Simulate craft build (SIM reserve→spend)',
+    (intentId, body, a) => service.buildWorkbench({
+      intentId,
+      ...(typeof body.action === 'string'
+        ? { action: body.action as 'start' | 'tick' | 'complete' | 'pause' | 'run' }
+        : {}),
+      audit: a,
+    }),
+    {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: { type: 'string', enum: ['start', 'tick', 'complete', 'pause', 'run'] },
+      },
+    },
+  );
+  wbWrite(
+    '/v1/forge/intents/:intentId/workbench/run-checks',
+    'runForgeWorkbenchChecks',
+    'Run three acceptance cases (checks ≠ accept)',
+    (intentId, _body, a) => service.runWorkbenchChecks({ intentId, audit: a }),
+  );
+  wbWrite(
+    '/v1/forge/intents/:intentId/workbench/feedback',
+    'feedbackForgeWorkbench',
+    'Client feedback on rush fee / delivery',
+    (intentId, body, a) => service.feedbackWorkbench({
+      intentId,
+      text: String(body.text ?? ''),
+      audit: a,
+    }),
+    {
+      type: 'object',
+      additionalProperties: false,
+      required: ['text'],
+      properties: { text: { type: 'string', minLength: 1, maxLength: 280 } },
+    },
+  );
+  wbWrite(
+    '/v1/forge/intents/:intentId/workbench/reply',
+    'replyForgeWorkbench',
+    'Maker reply to open feedback',
+    (intentId, body, a) => service.replyWorkbench({
+      intentId,
+      response: String(body.response ?? ''),
+      audit: a,
+    }),
+    {
+      type: 'object',
+      additionalProperties: false,
+      required: ['response'],
+      properties: { response: { type: 'string', minLength: 1, maxLength: 280 } },
+    },
+  );
+  wbWrite(
+    '/v1/forge/intents/:intentId/workbench/rules',
+    'rulesForgeWorkbench',
+    'Save pricing rules → version++',
+    (intentId, body, a) => service.rulesWorkbench({
+      intentId,
+      rule: {
+        price: Number(body.price),
+        threshold: Number(body.threshold),
+        rate: Number(body.rate),
+      },
+      audit: a,
+    }),
+    {
+      type: 'object',
+      additionalProperties: false,
+      required: ['price', 'threshold', 'rate'],
+      properties: {
+        price: { type: 'integer', minimum: 100, maximum: 10000 },
+        threshold: { type: 'integer', minimum: 1, maximum: 50 },
+        rate: { type: 'integer', minimum: 1, maximum: 100 },
+      },
+    },
+  );
+  wbWrite(
+    '/v1/forge/intents/:intentId/workbench/resolve-feedback',
+    'resolveForgeWorkbenchFeedback',
+    'Client confirms feedback resolved',
+    (intentId, _body, a) => service.resolveFeedbackWorkbench({ intentId, audit: a }),
+  );
+  wbWrite(
+    '/v1/forge/intents/:intentId/workbench/submit',
+    'submitForgeWorkbench',
+    'Submit delivery for client acceptance',
+    (intentId, _body, a) => service.submitWorkbench({ intentId, audit: a }),
+  );
+  wbWrite(
+    '/v1/forge/intents/:intentId/workbench/withdraw',
+    'withdrawForgeWorkbench',
+    'Withdraw pending submission',
+    (intentId, _body, a) => service.withdrawWorkbench({ intentId, audit: a }),
+  );
+  wbWrite(
+    '/v1/forge/intents/:intentId/workbench/return',
+    'returnForgeWorkbench',
+    'Client returns delivery for revision',
+    (intentId, body, a) => service.returnWorkbench({
+      intentId,
+      ...(typeof body.text === 'string' ? { text: body.text } : {}),
+      audit: a,
+    }),
+    {
+      type: 'object',
+      additionalProperties: false,
+      properties: { text: { type: 'string', maxLength: 280 } },
+    },
+  );
+  wbWrite(
+    '/v1/forge/intents/:intentId/workbench/accept-delivery',
+    'acceptForgeWorkbenchDelivery',
+    'Accept delivery → payable PAYABLE (unpaid)',
+    (intentId, _body, a) => service.acceptDeliveryWorkbench({ intentId, audit: a }),
+  );
+  wbWrite(
+    '/v1/forge/intents/:intentId/workbench/register-asset',
+    'registerForgeWorkbenchAsset',
+    'Register quote tool as team asset metadata',
+    (intentId, _body, a) => service.registerAssetWorkbench({ intentId, audit: a }),
+  );
+  wbWrite(
+    '/v1/forge/intents/:intentId/workbench/reset',
+    'resetForgeWorkbench',
+    'Reset demo workbench only',
+    (intentId, _body, a) => service.resetWorkbench({ intentId, audit: a }),
+  );
+
+  app.get<{
+    Headers: Pick<Headers, 'x-actor-id' | 'x-tenant-id'>;
+    Params: { intentId: string };
+  }>('/v1/forge/intents/:intentId/workbench/delivery.zip', {
+    schema: {
+      operationId: 'downloadForgeWorkbenchDelivery',
+      summary: 'Download delivery ZIP (html + json + readme)',
+      tags: ['InnoForge'],
+      headers: readHeaders,
+      params: wbParams,
+      response: { 200: { type: 'string', format: 'binary' }, 404: errorResponse, 409: errorResponse },
+    },
+  }, async (request, reply) => {
+    try {
+      const zip = await service.deliveryZipWorkbench({
+        intentId: request.params.intentId,
+        tenantId: request.headers['x-tenant-id'],
+      });
+      return reply
+        .header('content-type', 'application/zip')
+        .header('content-disposition', `attachment; filename="${zip.filename}"`)
+        .send(zip.buffer);
     } catch (error) {
       return fail(request, reply, error);
     }
