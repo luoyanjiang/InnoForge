@@ -74,6 +74,18 @@ import {
   type ForgeTreeNodeKind,
   type ForgeTreeNodeStatus,
 } from './forge-intent-tree.js';
+import {
+  canAdvanceTaskStatus,
+  freezeTask,
+  newTaskId,
+  normalizeExecutor,
+  normalizeTaskStatus,
+  simSpacesView,
+  type ForgeSpacesView,
+  type ForgeTask,
+  type ForgeTaskExecutor,
+  type ForgeTaskStatus,
+} from './forge-tasks.js';
 
 export type { ForgeConstraint } from './forge-constraints.js';
 export type { ForgeJudgment, ForgeJudgmentAction, ForgeVariantCandidate } from './forge-judgments.js';
@@ -103,6 +115,14 @@ export type {
   ForgeTreeNodeStatus,
 } from './forge-intent-tree.js';
 export { COLLAB_STAGE_ORDER, SCENARIOS } from './forge-intent-tree.js';
+export type {
+  ForgeSpacesView,
+  ForgeSpaceAsset,
+  ForgeTask,
+  ForgeTaskExecutor,
+  ForgeTaskStatus,
+} from './forge-tasks.js';
+export { scenarioPluginHints, seedTaskTitles, simSpacesView } from './forge-tasks.js';
 
 export type ForgeLoopStatus =
   | 'DRAFT'
@@ -288,6 +308,28 @@ export interface ForgeLoopService {
     memoryId: string;
     audit: ForgeAudit;
   }): Promise<{ memory: ForgeMemory; intent: ForgeIntent }>;
+  createTask(input: {
+    intentId: string;
+    title: string;
+    executor?: ForgeTaskExecutor | string;
+    treeNodeId?: string | null;
+    audit: ForgeAudit;
+  }): Promise<ForgeTask>;
+  listTasks(input: {
+    intentId: string;
+    tenantId: string;
+  }): Promise<readonly ForgeTask[]>;
+  updateTask(input: {
+    intentId: string;
+    taskId: string;
+    status?: ForgeTaskStatus | string;
+    executor?: ForgeTaskExecutor | string;
+    audit: ForgeAudit;
+  }): Promise<ForgeTask>;
+  getSpaces(input: {
+    tenantId: string;
+    locale?: string;
+  }): Promise<ForgeSpacesView>;
 }
 
 export class ForgeLoopError extends Error {
@@ -322,6 +364,7 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
   private readonly snapshots = new Map<string, ForgeSnapshot>();
   private readonly lifeforms = new Map<string, ForgeLifeform>();
   private readonly memories = new Map<string, ForgeMemory>();
+  private readonly tasks = new Map<string, ForgeTask>();
   private readonly bridge: ForgePxnBridge;
 
   constructor(
@@ -1341,6 +1384,108 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
       events: Object.freeze([...record.events]),
     });
     return { memory: nextMemory, intent: record.view };
+  }
+
+  async createTask(input: {
+    intentId: string;
+    title: string;
+    executor?: ForgeTaskExecutor | string;
+    treeNodeId?: string | null;
+    audit: ForgeAudit;
+  }): Promise<ForgeTask> {
+    const intent = await this.get({ id: input.intentId, tenantId: input.audit.tenantId });
+    if (!intent) throw new ForgeLoopError('INTENT_NOT_FOUND');
+    const title = input.title.trim();
+    if (!title) throw new ForgeLoopError('TASK_TITLE_REQUIRED');
+    const treeNodeId = input.treeNodeId === undefined || input.treeNodeId === null
+      ? undefined
+      : String(input.treeNodeId);
+    if (treeNodeId && !intent.intentTree.nodes.some((n) => n.id === treeNodeId)) {
+      throw new ForgeLoopError('TREE_NODE_NOT_FOUND');
+    }
+    const task = freezeTask({
+      id: newTaskId(),
+      intentId: input.intentId,
+      tenantId: input.audit.tenantId,
+      ...(treeNodeId ? { treeNodeId } : {}),
+      title,
+      executor: normalizeExecutor(input.executor),
+      status: 'PENDING',
+      createdAt: input.audit.occurredAt,
+      updatedAt: input.audit.occurredAt,
+      createdBy: input.audit.actorId,
+    });
+    this.tasks.set(task.id, task);
+    this.appendIntentEvent(input.intentId, input.audit, 'forge.task.created', {
+      taskId: task.id,
+      title: task.title,
+      executor: task.executor,
+      treeNodeId: task.treeNodeId ?? null,
+    });
+    return task;
+  }
+
+  async listTasks(input: {
+    intentId: string;
+    tenantId: string;
+  }): Promise<readonly ForgeTask[]> {
+    const intent = await this.get({ id: input.intentId, tenantId: input.tenantId });
+    if (!intent) throw new ForgeLoopError('INTENT_NOT_FOUND');
+    return Object.freeze(
+      [...this.tasks.values()]
+        .filter((item) => item.intentId === input.intentId && item.tenantId === input.tenantId)
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)),
+    );
+  }
+
+  async updateTask(input: {
+    intentId: string;
+    taskId: string;
+    status?: ForgeTaskStatus | string;
+    executor?: ForgeTaskExecutor | string;
+    audit: ForgeAudit;
+  }): Promise<ForgeTask> {
+    const task = this.tasks.get(input.taskId);
+    if (!task || task.intentId !== input.intentId || task.tenantId !== input.audit.tenantId) {
+      throw new ForgeLoopError('TASK_NOT_FOUND');
+    }
+    let nextStatus = task.status;
+    if (input.status !== undefined) {
+      const target = normalizeTaskStatus(input.status);
+      if (target !== task.status) {
+        if (!canAdvanceTaskStatus(task.status, target)) {
+          throw new ForgeLoopError('TASK_STATUS_INVALID');
+        }
+        nextStatus = target;
+      }
+    }
+    const nextExecutor = input.executor !== undefined
+      ? normalizeExecutor(input.executor)
+      : task.executor;
+    const next = freezeTask({
+      ...task,
+      status: nextStatus,
+      executor: nextExecutor,
+      updatedAt: input.audit.occurredAt,
+    });
+    this.tasks.set(next.id, next);
+    this.appendIntentEvent(input.intentId, input.audit, 'forge.task.updated', {
+      taskId: next.id,
+      status: next.status,
+      executor: next.executor,
+      previousStatus: task.status,
+    });
+    return next;
+  }
+
+  async getSpaces(input: {
+    tenantId: string;
+    locale?: string;
+  }): Promise<ForgeSpacesView> {
+    return simSpacesView({
+      tenantId: input.tenantId,
+      ...(input.locale !== undefined ? { locale: input.locale } : {}),
+    });
   }
 
   async getIntentTree(input: {

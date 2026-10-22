@@ -493,6 +493,151 @@ export function registerForgeRoutes(app: FastifyInstance, service: ForgeLoopServ
     }
   });
 
+  app.get<{
+    Headers: Pick<Headers, 'x-actor-id' | 'x-tenant-id'>;
+    Params: { intentId: string };
+  }>('/v1/forge/intents/:intentId/tasks', {
+    schema: {
+      operationId: 'listForgeTasks',
+      summary: 'List create-flow tasks bound to an intent (F1)',
+      tags: ['InnoForge'],
+      headers: readHeaders,
+      params: { type: 'object', required: ['intentId'], properties: { intentId: id } },
+      response: { 200: response, 404: errorResponse },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.send({
+        tasks: await service.listTasks({
+          intentId: request.params.intentId,
+          tenantId: request.headers['x-tenant-id'],
+        }),
+      });
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
+  app.post<{
+    Headers: Headers;
+    Params: { intentId: string };
+    Body: { title: string; executor?: string; tree_node_id?: string | null };
+  }>('/v1/forge/intents/:intentId/tasks', {
+    schema: {
+      operationId: 'createForgeTask',
+      summary: 'Create a create-flow task (F1)',
+      tags: ['InnoForge'],
+      headers,
+      params: { type: 'object', required: ['intentId'], properties: { intentId: id } },
+      body: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['title'],
+        properties: {
+          title: { type: 'string', minLength: 1, maxLength: 240 },
+          executor: { type: 'string', enum: ['AI', 'HUMAN'] },
+          tree_node_id: { type: ['string', 'null'], maxLength: 512 },
+        },
+      },
+      response: {
+        201: response,
+        403: errorResponse,
+        404: errorResponse,
+        409: errorResponse,
+        500: errorResponse,
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.code(201).send(await service.createTask({
+        intentId: request.params.intentId,
+        title: request.body.title,
+        ...(request.body.executor !== undefined ? { executor: request.body.executor } : {}),
+        ...(request.body.tree_node_id !== undefined
+          ? { treeNodeId: request.body.tree_node_id }
+          : {}),
+        audit: audit(request),
+      }));
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
+  app.patch<{
+    Headers: Headers;
+    Params: { intentId: string; taskId: string };
+    Body: { status?: string; executor?: string };
+  }>('/v1/forge/intents/:intentId/tasks/:taskId', {
+    schema: {
+      operationId: 'updateForgeTask',
+      summary: 'Advance task status or change executor (F1)',
+      tags: ['InnoForge'],
+      headers,
+      params: {
+        type: 'object',
+        required: ['intentId', 'taskId'],
+        properties: { intentId: id, taskId: id },
+      },
+      body: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          status: {
+            type: 'string',
+            enum: ['PENDING', 'ASSIGNED', 'IN_PROGRESS', 'REVIEW', 'DONE', 'FAILED'],
+          },
+          executor: { type: 'string', enum: ['AI', 'HUMAN'] },
+        },
+      },
+      response: {
+        200: response,
+        403: errorResponse,
+        404: errorResponse,
+        409: errorResponse,
+        500: errorResponse,
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.send(await service.updateTask({
+        intentId: request.params.intentId,
+        taskId: request.params.taskId,
+        ...(request.body.status !== undefined ? { status: request.body.status } : {}),
+        ...(request.body.executor !== undefined ? { executor: request.body.executor } : {}),
+        audit: audit(request),
+      }));
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
+  app.get<{
+    Headers: Pick<Headers, 'x-actor-id' | 'x-tenant-id'>;
+    Querystring: { locale?: string };
+  }>('/v1/forge/spaces', {
+    schema: {
+      operationId: 'getForgeSpaces',
+      summary: 'Sim personal/team/project asset spaces (F1 — no object store)',
+      tags: ['InnoForge'],
+      headers: readHeaders,
+      querystring: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { locale: { type: 'string', enum: ['zh', 'en'] } },
+      },
+      response: { 200: response },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.send(await service.getSpaces({
+        tenantId: request.headers['x-tenant-id'],
+        ...(request.query.locale !== undefined ? { locale: request.query.locale } : {}),
+      }));
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
   app.get('/v1/forge/scenario-modes', {
     schema: {
       operationId: 'listForgeScenarioModes',
