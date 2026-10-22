@@ -30,6 +30,11 @@ import {
   type ForgeAllocationWeights,
   type ForgeCreditAllocation,
 } from './forge-allocations.js';
+import {
+  buildReputation,
+  computeReputationScore,
+  type ForgeReputation,
+} from './forge-reputation.js';
 
 export type { ForgeConstraint } from './forge-constraints.js';
 export type { ForgeJudgment, ForgeJudgmentAction, ForgeVariantCandidate } from './forge-judgments.js';
@@ -40,6 +45,8 @@ export type {
   ForgeCreditAllocation,
 } from './forge-allocations.js';
 export { DEFAULT_ALLOCATION_WEIGHTS } from './forge-allocations.js';
+export type { ForgeReputation } from './forge-reputation.js';
+export { REPUTATION_BASELINE } from './forge-reputation.js';
 
 export type ForgeLoopStatus =
   | 'DRAFT'
@@ -93,6 +100,7 @@ export type CreditAccount = Readonly<{
   principalId: string;
   balance: number;
   staked: number;
+  reputation: ForgeReputation;
 }>;
 
 export interface ForgeLoopService {
@@ -230,6 +238,50 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
     return `${tenantId}::${principalId}`;
   }
 
+  private reputationFor(tenantId: string, principalId: string): ForgeReputation {
+    const settledIds = new Set(
+      [...this.intents.values()]
+        .filter((item) => item.view.tenantId === tenantId && item.view.status === 'SETTLED')
+        .map((item) => item.view.id),
+    );
+    const countsByPrincipal = new Map<string, { adoptSettled: number; rejects: number }>();
+    for (const judgment of this.judgments.values()) {
+      if (judgment.tenantId !== tenantId) continue;
+      const current = countsByPrincipal.get(judgment.actorId) ?? { adoptSettled: 0, rejects: 0 };
+      if (judgment.action === 'REJECT') current.rejects += 1;
+      if (judgment.action === 'ADOPT' && settledIds.has(judgment.intentId)) current.adoptSettled += 1;
+      countsByPrincipal.set(judgment.actorId, current);
+    }
+    const peerScores = new Map<string, number>();
+    for (const [id, counts] of countsByPrincipal) {
+      peerScores.set(id, computeReputationScore({
+        adoptSettledCount: counts.adoptSettled,
+        rejectCount: counts.rejects,
+      }));
+    }
+    const self = countsByPrincipal.get(principalId) ?? { adoptSettled: 0, rejects: 0 };
+    return buildReputation({
+      principalId,
+      adoptSettledCount: self.adoptSettled,
+      rejectCount: self.rejects,
+      peerScores,
+    });
+  }
+
+  private toAccountView(
+    tenantId: string,
+    principalId: string,
+    account: MutableAccount,
+  ): CreditAccount {
+    return Object.freeze({
+      tenantId,
+      principalId,
+      balance: account.balance,
+      staked: account.staked,
+      reputation: this.reputationFor(tenantId, principalId),
+    });
+  }
+
   async ensureAccount(input: {
     tenantId: string;
     principalId: string;
@@ -241,23 +293,13 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
       account = { balance: input.openingBalance ?? 1000, staked: 0 };
       this.accounts.set(key, account);
     }
-    return Object.freeze({
-      tenantId: input.tenantId,
-      principalId: input.principalId,
-      balance: account.balance,
-      staked: account.staked,
-    });
+    return this.toAccountView(input.tenantId, input.principalId, account);
   }
 
   async getAccount(input: { tenantId: string; principalId: string }): Promise<CreditAccount | undefined> {
     const account = this.accounts.get(this.accountKey(input.tenantId, input.principalId));
     if (!account) return undefined;
-    return Object.freeze({
-      tenantId: input.tenantId,
-      principalId: input.principalId,
-      balance: account.balance,
-      staked: account.staked,
-    });
+    return this.toAccountView(input.tenantId, input.principalId, account);
   }
 
   async topUp(input: {
@@ -269,14 +311,10 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
     if (!(input.amount > 0) || !Number.isFinite(input.amount)) throw new ForgeLoopError('TOPUP_INVALID');
     if (input.audit.tenantId !== input.tenantId) throw new ForgeLoopError('TENANT_SCOPE_MISMATCH');
     await this.ensureAccount({ tenantId: input.tenantId, principalId: input.principalId });
-    const mutable = this.accounts.get(this.accountKey(input.tenantId, input.principalId))!;
+    const mutable = this.accounts.get(this.accountKey(input.tenantId, input.principalId));
+    if (!mutable) throw new ForgeLoopError('ACCOUNT_NOT_FOUND');
     mutable.balance += input.amount;
-    return Object.freeze({
-      tenantId: input.tenantId,
-      principalId: input.principalId,
-      balance: mutable.balance,
-      staked: mutable.staked,
-    });
+    return this.toAccountView(input.tenantId, input.principalId, mutable);
   }
 
   async createIntent(input: {
