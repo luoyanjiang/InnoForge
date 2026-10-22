@@ -511,6 +511,207 @@ export function registerForgeRoutes(app: FastifyInstance, service: ForgeLoopServ
     }
   });
 
+  app.get<{ Headers: Pick<Headers, 'x-actor-id' | 'x-tenant-id'> }>('/v1/forge/lifeforms', {
+    schema: {
+      operationId: 'listForgeLifeforms',
+      summary: 'List lifeforms for tenant (G7 lifecycle)',
+      tags: ['InnoForge'],
+      headers: readHeaders,
+      response: { 200: response },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.send({
+        lifeforms: await service.listLifeforms({
+          tenantId: request.headers['x-tenant-id'],
+        }),
+      });
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
+  app.get<{
+    Headers: Pick<Headers, 'x-actor-id' | 'x-tenant-id'>;
+    Params: { lifeformId: string };
+  }>('/v1/forge/lifeforms/:lifeformId', {
+    schema: {
+      operationId: 'getForgeLifeform',
+      summary: 'Get one lifeform by id (G7)',
+      tags: ['InnoForge'],
+      headers: readHeaders,
+      params: { type: 'object', required: ['lifeformId'], properties: { lifeformId: id } },
+      response: { 200: response, 404: errorResponse },
+    },
+  }, async (request, reply) => {
+    try {
+      const lifeform = await service.getLifeform({
+        id: request.params.lifeformId,
+        tenantId: request.headers['x-tenant-id'],
+      });
+      if (!lifeform) return fail(request, reply, new ForgeLoopError('LIFEFORM_NOT_FOUND'));
+      return reply.send(lifeform);
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
+  app.post<{
+    Headers: Headers;
+    Body: { intent_id: string; name?: string };
+  }>('/v1/forge/lifeforms', {
+    schema: {
+      operationId: 'createForgeLifeform',
+      summary: 'Promote SETTLED intent to lifeform (G7)',
+      tags: ['InnoForge'],
+      headers,
+      body: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['intent_id'],
+        properties: {
+          intent_id: id,
+          name: { type: 'string', maxLength: 128 },
+        },
+      },
+      response: {
+        201: response,
+        403: errorResponse,
+        404: errorResponse,
+        409: errorResponse,
+        500: errorResponse,
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.code(201).send(await service.createLifeform({
+        intentId: request.body.intent_id,
+        ...(request.body.name !== undefined ? { name: request.body.name } : {}),
+        audit: audit(request),
+      }));
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
+  app.post<{
+    Headers: Headers;
+    Params: { lifeformId: string };
+    Body: { summary: string };
+  }>('/v1/forge/lifeforms/:lifeformId/proposals', {
+    schema: {
+      operationId: 'addForgeLifeformProposal',
+      summary: 'Add evolution proposal to ACTIVE lifeform (G7)',
+      tags: ['InnoForge'],
+      headers,
+      params: { type: 'object', required: ['lifeformId'], properties: { lifeformId: id } },
+      body: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['summary'],
+        properties: { summary: { type: 'string', minLength: 1, maxLength: 500 } },
+      },
+      response: {
+        201: response,
+        403: errorResponse,
+        404: errorResponse,
+        409: errorResponse,
+        500: errorResponse,
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.code(201).send(await service.addLifeformProposal({
+        lifeformId: request.params.lifeformId,
+        summary: request.body.summary,
+        audit: audit(request),
+      }));
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
+  app.post<{
+    Headers: Headers;
+    Params: { lifeformId: string; proposalId: string };
+    Body: { decision: 'ACCEPTED' | 'REJECTED' };
+  }>('/v1/forge/lifeforms/:lifeformId/proposals/:proposalId/decide', {
+    schema: {
+      operationId: 'decideForgeLifeformProposal',
+      summary: 'Accept or reject a pending evolution proposal (G7)',
+      tags: ['InnoForge'],
+      headers,
+      params: {
+        type: 'object',
+        required: ['lifeformId', 'proposalId'],
+        properties: { lifeformId: id, proposalId: id },
+      },
+      body: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['decision'],
+        properties: { decision: { type: 'string', enum: ['ACCEPTED', 'REJECTED'] } },
+      },
+      response: {
+        200: response,
+        403: errorResponse,
+        404: errorResponse,
+        409: errorResponse,
+        500: errorResponse,
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.send(await service.decideLifeformProposal({
+        lifeformId: request.params.lifeformId,
+        proposalId: request.params.proposalId,
+        decision: request.body.decision,
+        audit: audit(request),
+      }));
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
+  app.post<{
+    Headers: Headers;
+    Params: { lifeformId: string };
+    Body: { status: 'ACTIVE' | 'FROZEN' | 'TERMINATED' };
+  }>('/v1/forge/lifeforms/:lifeformId/status', {
+    schema: {
+      operationId: 'setForgeLifeformStatus',
+      summary: 'Freeze, unfreeze, or terminate a lifeform (G7)',
+      tags: ['InnoForge'],
+      headers,
+      params: { type: 'object', required: ['lifeformId'], properties: { lifeformId: id } },
+      body: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['status'],
+        properties: {
+          status: { type: 'string', enum: ['ACTIVE', 'FROZEN', 'TERMINATED'] },
+        },
+      },
+      response: {
+        200: response,
+        403: errorResponse,
+        404: errorResponse,
+        409: errorResponse,
+        500: errorResponse,
+      },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.send(await service.setLifeformStatus({
+        lifeformId: request.params.lifeformId,
+        status: request.body.status,
+        audit: audit(request),
+      }));
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
   app.post<{
     Headers: Headers;
     Params: { intentId: string };

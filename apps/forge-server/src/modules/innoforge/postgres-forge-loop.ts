@@ -56,6 +56,15 @@ import {
   summarizeJudgments,
   type ForgeSnapshotJudgmentSummary,
 } from './forge-snapshots.js';
+import {
+  freezeLifeform,
+  freezeProposal,
+  lifeformIdFor,
+  newProposalId,
+  type ForgeLifeform,
+  type ForgeLifeformProposal,
+  type ForgeLifeformStatus,
+} from './forge-lifeforms.js';
 
 type JudgmentRow = {
   id: string;
@@ -950,6 +959,271 @@ export class PostgresForgeLoopService implements ForgeLoopService {
       candidateSnapshot: immutableJsonCopy(row.candidate_snapshot),
       occurredAt: new Date(row.occurred_at).toISOString(),
     });
+  }
+
+  private lifeformFromRow(row: {
+    id: string;
+    intent_id: string;
+    tenant_id: string;
+    name: string;
+    status: ForgeLifeformStatus;
+    proposals: ForgeLifeformProposal[] | null;
+    created_at: Date;
+    updated_at: Date;
+    created_by: string;
+  }): ForgeLifeform {
+    const proposals = Array.isArray(row.proposals)
+      ? row.proposals.map((item) => freezeProposal(item))
+      : [];
+    return freezeLifeform({
+      id: row.id,
+      intentId: row.intent_id,
+      tenantId: row.tenant_id,
+      name: row.name,
+      status: row.status,
+      proposals,
+      createdAt: new Date(row.created_at).toISOString(),
+      updatedAt: new Date(row.updated_at).toISOString(),
+      createdBy: row.created_by,
+    });
+  }
+
+  async createLifeform(input: {
+    intentId: string;
+    name?: string;
+    audit: ForgeAudit;
+  }): Promise<ForgeLifeform> {
+    const intent = await this.requireIntent(input.intentId, input.audit.tenantId);
+    if (intent.status !== 'SETTLED') throw new ForgeLoopError('LIFEFORM_REQUIRES_SETTLED');
+    const id = lifeformIdFor(input.intentId);
+    const existing = await this.pool.query(
+      `SELECT * FROM forge_lifeforms WHERE id=$1`,
+      [id],
+    );
+    if (existing.rows[0]) return this.lifeformFromRow(existing.rows[0]);
+    const name = (input.name?.trim() || intent.statement.slice(0, 64) || input.intentId);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `INSERT INTO forge_lifeforms
+          (id, intent_id, tenant_id, name, status, proposals, created_at, updated_at, created_by)
+         VALUES ($1,$2,$3,$4,'ACTIVE','[]'::jsonb,$5::timestamptz,$5::timestamptz,$6)`,
+        [
+          id,
+          input.intentId,
+          input.audit.tenantId,
+          name,
+          input.audit.occurredAt,
+          input.audit.actorId,
+        ],
+      );
+      const payload = { lifeformId: id, name, status: 'ACTIVE' };
+      await this.insertEvent(client, input.intentId, 'forge.lifeform.created', input.audit, payload);
+      await this.appendDomainEvent(client, input.intentId, 'forge.lifeform.created', input.audit, payload);
+      await client.query(
+        `UPDATE forge_intents SET updated_at=$2::timestamptz WHERE id=$1`,
+        [input.intentId, input.audit.occurredAt],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    const created = await this.pool.query(`SELECT * FROM forge_lifeforms WHERE id=$1`, [id]);
+    if (!created.rows[0]) throw new ForgeLoopError('LIFEFORM_NOT_FOUND');
+    return this.lifeformFromRow(created.rows[0]);
+  }
+
+  async listLifeforms(input: { tenantId: string }): Promise<readonly ForgeLifeform[]> {
+    const result = await this.pool.query(
+      `SELECT * FROM forge_lifeforms
+        WHERE tenant_id=$1
+        ORDER BY updated_at DESC, id`,
+      [input.tenantId],
+    );
+    return Object.freeze(result.rows.map((row) => this.lifeformFromRow(row)));
+  }
+
+  async getLifeform(input: { id: string; tenantId: string }): Promise<ForgeLifeform | undefined> {
+    const result = await this.pool.query(
+      `SELECT * FROM forge_lifeforms WHERE id=$1 AND tenant_id=$2`,
+      [input.id, input.tenantId],
+    );
+    if (!result.rows[0]) return undefined;
+    return this.lifeformFromRow(result.rows[0]);
+  }
+
+  async addLifeformProposal(input: {
+    lifeformId: string;
+    summary: string;
+    audit: ForgeAudit;
+  }): Promise<ForgeLifeform> {
+    const lifeform = await this.getLifeform({
+      id: input.lifeformId,
+      tenantId: input.audit.tenantId,
+    });
+    if (!lifeform) throw new ForgeLoopError('LIFEFORM_NOT_FOUND');
+    if (lifeform.status !== 'ACTIVE') throw new ForgeLoopError('LIFEFORM_NOT_ACTIVE');
+    const summary = input.summary.trim();
+    if (!summary) throw new ForgeLoopError('PROPOSAL_SUMMARY_REQUIRED');
+    const proposal = freezeProposal({
+      id: newProposalId(),
+      summary,
+      status: 'PENDING',
+      createdAt: input.audit.occurredAt,
+    });
+    const next = freezeLifeform({
+      ...lifeform,
+      proposals: [...lifeform.proposals, proposal],
+      updatedAt: input.audit.occurredAt,
+    });
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE forge_lifeforms
+            SET proposals=$2::jsonb, updated_at=$3::timestamptz
+          WHERE id=$1`,
+        [next.id, JSON.stringify(next.proposals), input.audit.occurredAt],
+      );
+      const payload = {
+        lifeformId: next.id,
+        proposalId: proposal.id,
+        summary: proposal.summary,
+      };
+      await this.insertEvent(client, lifeform.intentId, 'forge.lifeform.proposal_added', input.audit, payload);
+      await this.appendDomainEvent(client, lifeform.intentId, 'forge.lifeform.proposal_added', input.audit, payload);
+      await client.query(
+        `UPDATE forge_intents SET updated_at=$2::timestamptz WHERE id=$1`,
+        [lifeform.intentId, input.audit.occurredAt],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    return next;
+  }
+
+  async decideLifeformProposal(input: {
+    lifeformId: string;
+    proposalId: string;
+    decision: 'ACCEPTED' | 'REJECTED';
+    audit: ForgeAudit;
+  }): Promise<ForgeLifeform> {
+    const lifeform = await this.getLifeform({
+      id: input.lifeformId,
+      tenantId: input.audit.tenantId,
+    });
+    if (!lifeform) throw new ForgeLoopError('LIFEFORM_NOT_FOUND');
+    if (lifeform.status !== 'ACTIVE') throw new ForgeLoopError('LIFEFORM_NOT_ACTIVE');
+    const index = lifeform.proposals.findIndex((item) => item.id === input.proposalId);
+    if (index < 0) throw new ForgeLoopError('PROPOSAL_NOT_FOUND');
+    const current = lifeform.proposals[index]!;
+    if (current.status !== 'PENDING') throw new ForgeLoopError('PROPOSAL_ALREADY_DECIDED');
+    const decided = freezeProposal({
+      ...current,
+      status: input.decision,
+      decidedAt: input.audit.occurredAt,
+      decidedBy: input.audit.actorId,
+    });
+    const proposals = [...lifeform.proposals];
+    proposals[index] = decided;
+    const next = freezeLifeform({
+      ...lifeform,
+      proposals,
+      updatedAt: input.audit.occurredAt,
+    });
+    const eventType = input.decision === 'ACCEPTED'
+      ? 'forge.lifeform.proposal_accepted'
+      : 'forge.lifeform.proposal_rejected';
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE forge_lifeforms
+            SET proposals=$2::jsonb, updated_at=$3::timestamptz
+          WHERE id=$1`,
+        [next.id, JSON.stringify(next.proposals), input.audit.occurredAt],
+      );
+      const payload = {
+        lifeformId: next.id,
+        proposalId: decided.id,
+        decision: input.decision,
+      };
+      await this.insertEvent(client, lifeform.intentId, eventType, input.audit, payload);
+      await this.appendDomainEvent(client, lifeform.intentId, eventType, input.audit, payload);
+      await client.query(
+        `UPDATE forge_intents SET updated_at=$2::timestamptz WHERE id=$1`,
+        [lifeform.intentId, input.audit.occurredAt],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    return next;
+  }
+
+  async setLifeformStatus(input: {
+    lifeformId: string;
+    status: ForgeLifeformStatus;
+    audit: ForgeAudit;
+  }): Promise<ForgeLifeform> {
+    const lifeform = await this.getLifeform({
+      id: input.lifeformId,
+      tenantId: input.audit.tenantId,
+    });
+    if (!lifeform) throw new ForgeLoopError('LIFEFORM_NOT_FOUND');
+    if (lifeform.status === 'TERMINATED') throw new ForgeLoopError('LIFEFORM_TERMINATED');
+    if (input.status === lifeform.status) return lifeform;
+    if (input.status === 'ACTIVE' && lifeform.status !== 'FROZEN') {
+      throw new ForgeLoopError('LIFEFORM_STATUS_INVALID');
+    }
+    if (input.status === 'FROZEN' && lifeform.status !== 'ACTIVE') {
+      throw new ForgeLoopError('LIFEFORM_STATUS_INVALID');
+    }
+    const next = freezeLifeform({
+      ...lifeform,
+      status: input.status,
+      updatedAt: input.audit.occurredAt,
+    });
+    const eventType = input.status === 'FROZEN'
+      ? 'forge.lifeform.frozen'
+      : input.status === 'ACTIVE'
+        ? 'forge.lifeform.unfrozen'
+        : 'forge.lifeform.terminated';
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE forge_lifeforms
+            SET status=$2, updated_at=$3::timestamptz
+          WHERE id=$1`,
+        [next.id, next.status, input.audit.occurredAt],
+      );
+      const payload = { lifeformId: next.id, status: next.status };
+      await this.insertEvent(client, lifeform.intentId, eventType, input.audit, payload);
+      await this.appendDomainEvent(client, lifeform.intentId, eventType, input.audit, payload);
+      await client.query(
+        `UPDATE forge_intents SET updated_at=$2::timestamptz WHERE id=$1`,
+        [lifeform.intentId, input.audit.occurredAt],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    return next;
   }
 
   private async requireIntent(id: string, tenantId: string): Promise<ForgeIntent> {
