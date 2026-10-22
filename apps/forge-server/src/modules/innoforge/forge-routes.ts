@@ -652,6 +652,98 @@ export function registerForgeRoutes(app: FastifyInstance, service: ForgeLoopServ
     properties: { intentId: id },
   } as const;
 
+  app.get<{
+    Headers: Pick<Headers, 'x-actor-id' | 'x-tenant-id'>;
+    Querystring: { locale?: string };
+  }>('/v1/forge/projects', {
+    schema: {
+      operationId: 'listForgeProjects',
+      summary: 'List projects (intents as Project containers)',
+      tags: ['InnoForge'],
+      headers: readHeaders,
+      querystring: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { locale: { type: 'string', enum: ['zh', 'en'] } },
+      },
+      response: { 200: response },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.send({
+        projects: await service.listProjects({
+          tenantId: request.headers['x-tenant-id'],
+          ...(request.query.locale === 'zh' || request.query.locale === 'en'
+            ? { locale: request.query.locale }
+            : {}),
+        }),
+      });
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
+  app.post<{
+    Headers: Headers;
+    Body: { lang?: 'zh' | 'en' };
+  }>('/v1/forge/projects/ensure-demo', {
+    schema: {
+      operationId: 'ensureForgeDemoProjects',
+      summary: 'Ensure demo projects (Lightboat + Hoshino)',
+      tags: ['InnoForge'],
+      headers,
+      body: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { lang: { type: 'string', enum: ['zh', 'en'] } },
+      },
+      response: { 200: response, 403: errorResponse, 500: errorResponse },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.send({
+        projects: await service.ensureDemoProjects({
+          audit: audit(request),
+          ...(request.body.lang !== undefined ? { locale: request.body.lang } : {}),
+        }),
+      });
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
+  app.get<{
+    Headers: Pick<Headers, 'x-actor-id' | 'x-tenant-id'>;
+    Querystring: { locale?: string };
+  }>('/v1/forge/my-tasks', {
+    schema: {
+      operationId: 'listForgeMyTasks',
+      summary: 'Cross-project task view (not a task space)',
+      tags: ['InnoForge'],
+      headers: readHeaders,
+      querystring: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { locale: { type: 'string', enum: ['zh', 'en'] } },
+      },
+      response: { 200: response },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.send({
+        tasks: await service.listMyTasks({
+          tenantId: request.headers['x-tenant-id'],
+          actorId: request.headers['x-actor-id'],
+          ...(request.query.locale === 'zh' || request.query.locale === 'en'
+            ? { locale: request.query.locale }
+            : {}),
+        }),
+      });
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
   app.post<{
     Headers: Headers;
     Body: { intent_id?: string; lang?: 'zh' | 'en' };
