@@ -22,9 +22,11 @@ import {
   type ForgePxnBridge,
   type ForgePxnPath,
 } from './pxn-bridge.js';
+import { buildTimeline, type ForgeTimelineItem } from './forge-timeline.js';
 
 export type { ForgeConstraint } from './forge-constraints.js';
 export type { ForgeJudgment, ForgeJudgmentAction, ForgeVariantCandidate } from './forge-judgments.js';
+export type { ForgeTimelineItem, ForgeTimelineKind } from './forge-timeline.js';
 
 export type ForgeLoopStatus =
   | 'DRAFT'
@@ -116,6 +118,10 @@ export interface ForgeLoopService {
     impact?: string;
     audit: ForgeAudit;
   }): Promise<ForgeJudgment>;
+  listTimeline(input: {
+    tenantId: string;
+    intentId?: string;
+  }): Promise<readonly ForgeTimelineItem[]>;
 }
 
 export class ForgeLoopError extends Error {
@@ -589,6 +595,29 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
       });
     }
     return judgment;
+  }
+
+  async listTimeline(input: {
+    tenantId: string;
+    intentId?: string;
+  }): Promise<readonly ForgeTimelineItem[]> {
+    if (input.intentId) {
+      const intent = await this.get({ id: input.intentId, tenantId: input.tenantId });
+      if (!intent) throw new ForgeLoopError('INTENT_NOT_FOUND');
+      const judgments = await this.listJudgments({
+        intentId: input.intentId,
+        tenantId: input.tenantId,
+      });
+      return buildTimeline({ intents: [intent], judgments });
+    }
+    const intents = await this.listIntents({ tenantId: input.tenantId });
+    const judgments: ForgeJudgment[] = [];
+    for (const intent of intents) {
+      judgments.push(
+        ...(await this.listJudgments({ intentId: intent.id, tenantId: input.tenantId })),
+      );
+    }
+    return buildTimeline({ intents, judgments });
   }
 }
 

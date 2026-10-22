@@ -27,12 +27,14 @@ import {
   type ForgeIntent,
   type ForgeLoopService,
   type ForgeLoopStatus,
+  type ForgeTimelineItem,
 } from './forge-loop.js';
 import {
   createPxnBridge,
   type ForgePxnBridge,
   type ForgePxnPath,
 } from './pxn-bridge.js';
+import { buildTimeline } from './forge-timeline.js';
 
 type JudgmentRow = {
   id: string;
@@ -537,6 +539,29 @@ export class PostgresForgeLoopService implements ForgeLoopService {
       [input.intentId, input.tenantId],
     );
     return result.rows.map((row) => this.judgmentToView(row));
+  }
+
+  async listTimeline(input: {
+    tenantId: string;
+    intentId?: string;
+  }): Promise<readonly ForgeTimelineItem[]> {
+    if (input.intentId) {
+      const intent = await this.get({ id: input.intentId, tenantId: input.tenantId });
+      if (!intent) throw new ForgeLoopError('INTENT_NOT_FOUND');
+      const judgments = await this.listJudgments({
+        intentId: input.intentId,
+        tenantId: input.tenantId,
+      });
+      return buildTimeline({ intents: [intent], judgments });
+    }
+    const intents = await this.listIntents({ tenantId: input.tenantId });
+    const judgments: ForgeJudgment[] = [];
+    for (const intent of intents) {
+      judgments.push(
+        ...(await this.listJudgments({ intentId: intent.id, tenantId: input.tenantId })),
+      );
+    }
+    return buildTimeline({ intents, judgments });
   }
 
   async recordJudgment(input: {
