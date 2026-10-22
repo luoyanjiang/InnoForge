@@ -58,6 +58,22 @@ import {
   type ForgeMemory,
   type ForgeMemoryStatus,
 } from './forge-memories.js';
+import {
+  canAdvanceCollabStage,
+  freezeIntentTree,
+  freezeTreeNode,
+  newTreeNodeId,
+  normalizeCollabStage,
+  normalizeIntentTree,
+  normalizeScenario,
+  seedIntentTree,
+  type ForgeCollabStage,
+  type ForgeIntentTree,
+  type ForgeScenario,
+  type ForgeTreeNode,
+  type ForgeTreeNodeKind,
+  type ForgeTreeNodeStatus,
+} from './forge-intent-tree.js';
 
 export type { ForgeConstraint } from './forge-constraints.js';
 export type { ForgeJudgment, ForgeJudgmentAction, ForgeVariantCandidate } from './forge-judgments.js';
@@ -78,6 +94,15 @@ export type {
   ForgeLifeformStatus,
 } from './forge-lifeforms.js';
 export type { ForgeMemory, ForgeMemoryStatus } from './forge-memories.js';
+export type {
+  ForgeCollabStage,
+  ForgeIntentTree,
+  ForgeScenario,
+  ForgeTreeNode,
+  ForgeTreeNodeKind,
+  ForgeTreeNodeStatus,
+} from './forge-intent-tree.js';
+export { COLLAB_STAGE_ORDER, SCENARIOS } from './forge-intent-tree.js';
 
 export type ForgeLoopStatus =
   | 'DRAFT'
@@ -105,6 +130,9 @@ export type ForgeIntent = Readonly<{
   frozen: boolean;
   stake: number;
   status: ForgeLoopStatus;
+  scenario: ForgeScenario;
+  collabStage: ForgeCollabStage;
+  intentTree: ForgeIntentTree;
   adapterId: string;
   pxnTaskId?: string;
   pxnPath?: ForgePxnPath;
@@ -145,6 +173,7 @@ export interface ForgeLoopService {
     constraints?: readonly ForgeConstraint[] | unknown;
     adapterId?: string;
     pxnTaskId?: string;
+    scenario?: ForgeScenario | string;
     audit: ForgeAudit;
   }): Promise<ForgeIntent>;
   updateIntent(input: {
@@ -152,8 +181,33 @@ export interface ForgeLoopService {
     statement?: string;
     constraints?: readonly ForgeConstraint[] | unknown;
     frozen?: boolean;
+    scenario?: ForgeScenario | string;
+    collabStage?: ForgeCollabStage | string;
     audit: ForgeAudit;
   }): Promise<ForgeIntent>;
+  getIntentTree(input: {
+    intentId: string;
+    tenantId: string;
+  }): Promise<ForgeIntentTree>;
+  replaceIntentTree(input: {
+    intentId: string;
+    tree: ForgeIntentTree | unknown;
+    audit: ForgeAudit;
+  }): Promise<ForgeIntentTree>;
+  addTreeNode(input: {
+    intentId: string;
+    parentId?: string | null;
+    kind: ForgeTreeNodeKind | string;
+    title: string;
+    audit: ForgeAudit;
+  }): Promise<ForgeIntentTree>;
+  updateTreeNode(input: {
+    intentId: string;
+    nodeId: string;
+    title?: string;
+    status?: ForgeTreeNodeStatus | string;
+    audit: ForgeAudit;
+  }): Promise<ForgeIntentTree>;
   confirm(input: { id: string; audit: ForgeAudit }): Promise<ForgeIntent>;
   deploy(input: { id: string; audit: ForgeAudit }): Promise<ForgeIntent>;
   feedback(input: { id: string; audit: ForgeAudit }): Promise<ForgeIntent>;
@@ -413,6 +467,7 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
     constraints?: readonly ForgeConstraint[] | unknown;
     adapterId?: string;
     pxnTaskId?: string;
+    scenario?: ForgeScenario | string;
     audit: ForgeAudit;
   }): Promise<ForgeIntent> {
     if (input.audit.actorId !== input.audit.tenantId && !input.audit.actorId) {
@@ -421,6 +476,7 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
     if (!(input.stake > 0) || !Number.isFinite(input.stake)) throw new ForgeLoopError('STAKE_INVALID');
     if (!input.statement.trim()) throw new ForgeLoopError('STATEMENT_REQUIRED');
     const constraints = normalizeConstraints(input.constraints);
+    const scenario = normalizeScenario(input.scenario);
     const existing = this.intents.get(input.id);
     if (existing) {
       if (existing.view.tenantId !== input.audit.tenantId) throw new ForgeLoopError('TENANT_SCOPE_MISMATCH');
@@ -451,6 +507,12 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
       ...(input.pxnTaskId ? { existingTaskId: input.pxnTaskId } : {}),
       audit: input.audit,
     });
+    const intentTree = seedIntentTree({
+      intentId: input.id,
+      statement: input.statement.trim(),
+      constraints,
+      at: input.audit.occurredAt,
+    });
     const ev = event('forge.intent.staked', input.audit, {
       stake: input.stake,
       adapterId,
@@ -458,6 +520,8 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
       pxnTaskId: pxnPath.taskId,
       pxnTaskState: pxnPath.taskState ?? null,
       constraints,
+      scenario,
+      collabStage: 'DRAFT',
     });
     const view: ForgeIntent = Object.freeze({
       id: input.id,
@@ -468,6 +532,9 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
       frozen: false,
       stake: input.stake,
       status: 'STAKED',
+      scenario,
+      collabStage: 'DRAFT',
+      intentTree,
       adapterId,
       pxnTaskId: pxnPath.taskId,
       pxnPath,
@@ -485,6 +552,8 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
     statement?: string;
     constraints?: readonly ForgeConstraint[] | unknown;
     frozen?: boolean;
+    scenario?: ForgeScenario | string;
+    collabStage?: ForgeCollabStage | string;
     audit: ForgeAudit;
   }): Promise<ForgeIntent> {
     const record = this.intents.get(input.id);
@@ -508,12 +577,29 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
     const nextConstraints = input.constraints !== undefined
       ? normalizeConstraints(input.constraints)
       : record.view.constraints;
+    const nextScenario = input.scenario !== undefined
+      ? normalizeScenario(input.scenario)
+      : record.view.scenario;
+    let nextStage = record.view.collabStage;
+    if (input.collabStage !== undefined) {
+      const target = normalizeCollabStage(input.collabStage);
+      if (target !== record.view.collabStage) {
+        if (!canAdvanceCollabStage(record.view.collabStage, target)) {
+          throw new ForgeLoopError('COLLAB_STAGE_INVALID');
+        }
+        nextStage = target;
+      }
+    }
 
     const contentChanged =
       nextStatement !== record.view.statement
       || !constraintsEqual(nextConstraints, record.view.constraints);
     const freezeChanged = nextFrozen !== record.view.frozen;
-    if (!contentChanged && !freezeChanged) return record.view;
+    const scenarioChanged = nextScenario !== record.view.scenario;
+    const stageChanged = nextStage !== record.view.collabStage;
+    if (!contentChanged && !freezeChanged && !scenarioChanged && !stageChanged) {
+      return record.view;
+    }
 
     if (contentChanged) {
       const ev = event('forge.intent.updated', input.audit, {
@@ -530,11 +616,27 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
       );
       record.events.push(ev);
     }
+    if (scenarioChanged) {
+      const ev = event('forge.scenario.changed', input.audit, {
+        scenario: nextScenario,
+        previous: record.view.scenario,
+      });
+      record.events.push(ev);
+    }
+    if (stageChanged) {
+      const ev = event('forge.collab_stage.changed', input.audit, {
+        collabStage: nextStage,
+        previous: record.view.collabStage,
+      });
+      record.events.push(ev);
+    }
     record.view = Object.freeze({
       ...record.view,
       statement: nextStatement,
       constraints: nextConstraints,
       frozen: nextFrozen,
+      scenario: nextScenario,
+      collabStage: nextStage,
       updatedAt: input.audit.occurredAt,
       events: Object.freeze([...record.events]),
     });
@@ -1239,6 +1341,131 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
       events: Object.freeze([...record.events]),
     });
     return { memory: nextMemory, intent: record.view };
+  }
+
+  async getIntentTree(input: {
+    intentId: string;
+    tenantId: string;
+  }): Promise<ForgeIntentTree> {
+    const intent = await this.get({ id: input.intentId, tenantId: input.tenantId });
+    if (!intent) throw new ForgeLoopError('INTENT_NOT_FOUND');
+    return intent.intentTree;
+  }
+
+  async replaceIntentTree(input: {
+    intentId: string;
+    tree: ForgeIntentTree | unknown;
+    audit: ForgeAudit;
+  }): Promise<ForgeIntentTree> {
+    const record = this.intents.get(input.intentId);
+    if (!record || record.view.tenantId !== input.audit.tenantId) {
+      throw new ForgeLoopError('INTENT_NOT_FOUND');
+    }
+    const tree = normalizeIntentTree(input.tree, input.audit.occurredAt);
+    record.view = Object.freeze({
+      ...record.view,
+      intentTree: tree,
+      updatedAt: input.audit.occurredAt,
+    });
+    this.appendIntentEvent(input.intentId, input.audit, 'forge.tree.replaced', {
+      nodeCount: tree.nodes.length,
+    });
+    return tree;
+  }
+
+  async addTreeNode(input: {
+    intentId: string;
+    parentId?: string | null;
+    kind: ForgeTreeNodeKind | string;
+    title: string;
+    audit: ForgeAudit;
+  }): Promise<ForgeIntentTree> {
+    const record = this.intents.get(input.intentId);
+    if (!record || record.view.tenantId !== input.audit.tenantId) {
+      throw new ForgeLoopError('INTENT_NOT_FOUND');
+    }
+    const title = input.title.trim();
+    if (!title) throw new ForgeLoopError('TREE_NODE_TITLE_REQUIRED');
+    const kind: ForgeTreeNodeKind =
+      input.kind === 'CONSTRAINT'
+      || input.kind === 'SUCCESS'
+      || input.kind === 'BRANCH'
+      || input.kind === 'GOAL'
+        ? input.kind
+        : 'BRANCH';
+    const parentId = input.parentId === undefined ? null : input.parentId;
+    if (parentId) {
+      const parent = record.view.intentTree.nodes.find((n) => n.id === parentId);
+      if (!parent) throw new ForgeLoopError('TREE_PARENT_NOT_FOUND');
+    }
+    const node = freezeTreeNode({
+      id: newTreeNodeId(),
+      parentId,
+      kind,
+      title,
+      status: 'OPEN',
+    });
+    const tree = freezeIntentTree({
+      nodes: [...record.view.intentTree.nodes, node],
+      updatedAt: input.audit.occurredAt,
+    });
+    record.view = Object.freeze({
+      ...record.view,
+      intentTree: tree,
+      updatedAt: input.audit.occurredAt,
+    });
+    this.appendIntentEvent(input.intentId, input.audit, 'forge.tree.node_added', {
+      nodeId: node.id,
+      kind: node.kind,
+      title: node.title,
+    });
+    return tree;
+  }
+
+  async updateTreeNode(input: {
+    intentId: string;
+    nodeId: string;
+    title?: string;
+    status?: ForgeTreeNodeStatus | string;
+    audit: ForgeAudit;
+  }): Promise<ForgeIntentTree> {
+    const record = this.intents.get(input.intentId);
+    if (!record || record.view.tenantId !== input.audit.tenantId) {
+      throw new ForgeLoopError('INTENT_NOT_FOUND');
+    }
+    const index = record.view.intentTree.nodes.findIndex((n) => n.id === input.nodeId);
+    if (index < 0) throw new ForgeLoopError('TREE_NODE_NOT_FOUND');
+    const current = record.view.intentTree.nodes[index]!;
+    const nextTitle = input.title !== undefined ? input.title.trim() : current.title;
+    if (!nextTitle) throw new ForgeLoopError('TREE_NODE_TITLE_REQUIRED');
+    const nextStatus: ForgeTreeNodeStatus =
+      input.status === 'ALIGNED'
+      || input.status === 'CONFLICT'
+      || input.status === 'DONE'
+      || input.status === 'OPEN'
+        ? input.status
+        : current.status;
+    const nodes = [...record.view.intentTree.nodes];
+    nodes[index] = freezeTreeNode({
+      ...current,
+      title: nextTitle,
+      status: nextStatus,
+    });
+    const tree = freezeIntentTree({
+      nodes,
+      updatedAt: input.audit.occurredAt,
+    });
+    record.view = Object.freeze({
+      ...record.view,
+      intentTree: tree,
+      updatedAt: input.audit.occurredAt,
+    });
+    this.appendIntentEvent(input.intentId, input.audit, 'forge.tree.node_updated', {
+      nodeId: input.nodeId,
+      title: nextTitle,
+      status: nextStatus,
+    });
+    return tree;
   }
 }
 

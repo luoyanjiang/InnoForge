@@ -2,6 +2,7 @@ import { t } from './i18n.js';
 
 const NAV = [
   ['overview', 'navOverview'],
+  ['tree', 'navTree'],
   ['workbench', 'navWorkbench'],
   ['collab', 'navCollab'],
   ['discover', 'navDiscover'],
@@ -15,16 +16,21 @@ const NAV = [
   ['history', 'navHistory'],
 ];
 
+const COLLAB_STAGES = ['DRAFT', 'EXPLORING', 'VALIDATING', 'COMMITTED'];
+const SCENARIOS = ['PRODUCT', 'RESEARCH', 'HARDWARE'];
+
 const state = {
   locale: localStorage.getItem('forge.locale') || 'zh',
   page: localStorage.getItem('forge.page') || 'overview',
   tenantId: localStorage.getItem('forge.tenant') || 'tenant.demo',
   actorId: localStorage.getItem('forge.actor') || 'user.demo',
+  scenarioMode: localStorage.getItem('forge.scenario') || 'PRODUCT',
   account: null,
   intents: [],
   adapters: [],
   editingIntent: null,
   selectedIntentId: localStorage.getItem('forge.intent') || null,
+  intentTree: null,
   variants: [],
   judgments: [],
   timeline: [],
@@ -280,13 +286,64 @@ async function refreshAdapters() {
   state.adapters = data.adapters || [];
 }
 
+function scenarioLabel(scenario) {
+  if (scenario === 'RESEARCH') return tt('scenarioResearch');
+  if (scenario === 'HARDWARE') return tt('scenarioHardware');
+  return tt('scenarioProduct');
+}
+
+function stageLabel(stage) {
+  if (stage === 'EXPLORING') return tt('stageExploring');
+  if (stage === 'VALIDATING') return tt('stageValidating');
+  if (stage === 'COMMITTED') return tt('stageCommitted');
+  return tt('stageDraft');
+}
+
+function treeKindLabel(kind) {
+  if (kind === 'CONSTRAINT') return tt('treeKindConstraint');
+  if (kind === 'SUCCESS') return tt('treeKindSuccess');
+  if (kind === 'BRANCH') return tt('treeKindBranch');
+  return tt('treeKindGoal');
+}
+
+function treeStatusLabel(status) {
+  if (status === 'ALIGNED') return tt('treeStatusAligned');
+  if (status === 'CONFLICT') return tt('treeStatusConflict');
+  if (status === 'DONE') return tt('treeStatusDone');
+  return tt('treeStatusOpen');
+}
+
+function nextCollabStage(current) {
+  const idx = COLLAB_STAGES.indexOf(current || 'DRAFT');
+  if (idx < 0 || idx >= COLLAB_STAGES.length - 1) return null;
+  return COLLAB_STAGES[idx + 1];
+}
+
 function renderNav() {
   const nav = el('nav');
-  nav.innerHTML = NAV.map(([id, key]) => (
-    `<button type="button" class="nav-item${state.page === id ? ' active' : ''}" data-page="${id}">${tt(key)}</button>`
-  )).join('');
+  nav.innerHTML = `
+    <div class="scenario-switch" id="scenario-switch">
+      <div class="stat-sub">${tt('scenarioMode')}</div>
+      <div class="btn-row scenario-row">
+        ${SCENARIOS.map((s) => `
+          <button type="button" class="btn ${state.scenarioMode === s ? 'btn-cyan' : 'btn-ghost'} scenario-btn" data-scenario="${s}">
+            ${scenarioLabel(s)}
+          </button>`).join('')}
+      </div>
+    </div>
+    ${NAV.map(([id, key]) => (
+      `<button type="button" class="nav-item${state.page === id ? ' active' : ''}" data-page="${id}">${tt(key)}</button>`
+    )).join('')}`;
   nav.querySelectorAll('.nav-item').forEach((btn) => {
     btn.addEventListener('click', () => navigate(btn.dataset.page));
+  });
+  nav.querySelectorAll('[data-scenario]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.scenarioMode = btn.dataset.scenario;
+      localStorage.setItem('forge.scenario', state.scenarioMode);
+      renderNav();
+      renderPage();
+    });
   });
 }
 
@@ -690,8 +747,31 @@ async function mountR3f(kind, containerId) {
 
 function renderCollab() {
   setHeader(tt('navCollab'), tt('collabTitle'), tt('collabSub'));
+  const intent = selectedIntent();
+  const stage = intent?.collabStage || 'DRAFT';
+  const next = nextCollabStage(stage);
   el('content').innerHTML = `
-    <div class="grid-2">
+    <div class="panel" id="collab-stage-panel">
+      <h3>${tt('collabStageTitle')} · ${scenarioLabel(intent?.scenario || state.scenarioMode)}</h3>
+      <p class="empty">${tt('collabStageHint')}</p>
+      <div class="stage-rail collab-stage-rail">
+        ${COLLAB_STAGES.map((s) => `<span class="${stage === s ? 'on' : ''}">${stageLabel(s)}</span>`).join('')}
+      </div>
+      <div class="btn-row">
+        <label class="field" style="flex:1;margin:0"><span>${tt('navCollab')}</span>
+          <select id="collab-intent">
+            ${state.intents.map((i) => `
+              <option value="${escapeAttr(i.id)}" ${i.id === intent?.id ? 'selected' : ''}>
+                ${escapeAttr(i.statement.slice(0, 40))} · ${stageLabel(i.collabStage || 'DRAFT')}
+              </option>`).join('') || `<option value="">${tt('emptyIntents')}</option>`}
+          </select>
+        </label>
+        <button type="button" class="btn btn-primary" id="collab-advance" ${intent && next ? '' : 'disabled'}>
+          ${next ? `${tt('collabStageAdvance')} → ${stageLabel(next)}` : tt('collabStageDone')}
+        </button>
+      </div>
+    </div>
+    <div class="grid-2" style="margin-top:0.85rem">
       <div class="panel">
         <h3>${tt('roles')}</h3>
         ${['Cost', 'Experience', 'Sustainability', 'Compliance'].map((r) => `<div class="list-row"><span>${r}</span><span class="badge cyan">AI</span></div>`).join('')}
@@ -712,6 +792,23 @@ function renderCollab() {
   state.roomLogs.negotiate.forEach((m) => appendRoomLog('negotiate', m));
   connectSse('negotiate');
   void mountR3f('collab', 'collab-3d');
+  el('collab-intent')?.addEventListener('change', (event) => {
+    state.selectedIntentId = event.target.value || null;
+    if (state.selectedIntentId) localStorage.setItem('forge.intent', state.selectedIntentId);
+    renderCollab();
+  });
+  el('collab-advance')?.addEventListener('click', async () => {
+    if (!intent || !next) return;
+    try {
+      await api('PATCH', `/v1/forge/intents/${encodeURIComponent(intent.id)}`, {
+        body: { collab_stage: next },
+        idempotencyKey: `stage:${intent.id}:${next}`,
+      });
+      await refreshIntents();
+      toast(`${stageLabel(stage)} → ${stageLabel(next)}`);
+      renderCollab();
+    } catch (error) { toast(error.message); }
+  });
   el('nego')?.addEventListener('click', async () => {
     await api('POST', '/v1/forge/sse/negotiate/messages', {
       body: { text: state.locale === 'zh' ? '协商裁决：采纳 Cost 代理建议并写入责任链' : 'Negotiation: adopt Cost agent proposal onto custody chain' },
@@ -727,6 +824,114 @@ function renderCollab() {
       idempotencyKey: `nego-msg:${Date.now()}`,
     });
     el('nego-text').value = '';
+  });
+}
+
+async function refreshIntentTree(intentId) {
+  if (!intentId) {
+    state.intentTree = null;
+    return;
+  }
+  try {
+    const data = await api('GET', `/v1/forge/intents/${encodeURIComponent(intentId)}/tree`);
+    state.intentTree = data.tree || null;
+  } catch {
+    state.intentTree = selectedIntent()?.intentTree || null;
+  }
+}
+
+function renderTreeNodes(nodes) {
+  const byParent = new Map();
+  for (const node of nodes || []) {
+    const key = node.parentId || '';
+    if (!byParent.has(key)) byParent.set(key, []);
+    byParent.get(key).push(node);
+  }
+  const walk = (parentId, depth) => {
+    const kids = byParent.get(parentId || '') || [];
+    return kids.map((node) => `
+      <div class="tree-node" style="margin-left:${depth * 1.1}rem">
+        <div class="list-row">
+          <div>
+            <div><span class="badge cyan">${treeKindLabel(node.kind)}</span> ${escapeAttr(node.title)}</div>
+            <div class="stat-sub">${treeStatusLabel(node.status)} · <span class="mono">${escapeAttr(node.id.slice(0, 16))}</span></div>
+          </div>
+          <div class="btn-row">
+            <button type="button" class="btn btn-ghost" data-tree-status="${escapeAttr(node.id)}" data-status="ALIGNED">${tt('treeAlign')}</button>
+            <button type="button" class="btn btn-ghost" data-tree-status="${escapeAttr(node.id)}" data-status="CONFLICT">${tt('treeConflict')}</button>
+            <button type="button" class="btn btn-cyan" data-tree-status="${escapeAttr(node.id)}" data-status="DONE">${tt('treeDone')}</button>
+          </div>
+        </div>
+        ${walk(node.id, depth + 1)}
+      </div>`).join('');
+  };
+  return walk(null, 0) || `<p class="empty">${tt('treeEmpty')}</p>`;
+}
+
+function renderTree() {
+  setHeader(tt('navTree'), tt('treeTitle'), tt('treeSub'));
+  const intent = selectedIntent();
+  const tree = state.intentTree || intent?.intentTree;
+  const roots = (tree?.nodes || []).filter((n) => !n.parentId);
+  const rootId = roots[0]?.id || null;
+  el('content').innerHTML = `
+    <div class="panel" id="intent-tree-panel">
+      <p class="empty">${tt('treeHint')}</p>
+      <label class="field"><span>${tt('treeTitle')}</span>
+        <select id="tree-intent">
+          ${state.intents.map((i) => `
+            <option value="${escapeAttr(i.id)}" ${i.id === intent?.id ? 'selected' : ''}>
+              ${escapeAttr(i.statement.slice(0, 48))} · ${scenarioLabel(i.scenario || 'PRODUCT')}
+            </option>`).join('') || `<option value="">${tt('treeEmpty')}</option>`}
+        </select>
+      </label>
+      <div class="btn-row">
+        <input id="tree-node-title" placeholder="${tt('treeNodePh')}" ${intent ? '' : 'disabled'}>
+        <button type="button" class="btn btn-primary" id="tree-add-branch" ${intent && rootId ? '' : 'disabled'}>${tt('treeAddBranch')}</button>
+        <button type="button" class="btn btn-ghost" id="tree-add-constraint" ${intent && rootId ? '' : 'disabled'}>${tt('treeAddConstraint')}</button>
+        <button type="button" class="btn btn-ghost" id="tree-add-success" ${intent && rootId ? '' : 'disabled'}>${tt('treeAddSuccess')}</button>
+      </div>
+      <div id="tree-list" style="margin-top:0.85rem">
+        ${intent ? renderTreeNodes(tree?.nodes || []) : `<p class="empty">${tt('treeEmpty')}</p>`}
+      </div>
+    </div>`;
+  el('tree-intent')?.addEventListener('change', async (event) => {
+    state.selectedIntentId = event.target.value || null;
+    if (state.selectedIntentId) localStorage.setItem('forge.intent', state.selectedIntentId);
+    await refreshIntentTree(state.selectedIntentId);
+    renderTree();
+  });
+  const addNode = async (kind) => {
+    if (!intent || !rootId) return;
+    const title = el('tree-node-title')?.value?.trim();
+    if (!title) return toast(tt('treeNodePh'));
+    try {
+      const data = await api('POST', `/v1/forge/intents/${encodeURIComponent(intent.id)}/tree/nodes`, {
+        body: { parent_id: rootId, kind, title },
+        idempotencyKey: `tree-add:${intent.id}:${Date.now()}`,
+      });
+      state.intentTree = data.tree;
+      el('tree-node-title').value = '';
+      await refreshIntents();
+      renderTree();
+    } catch (error) { toast(error.message); }
+  };
+  el('tree-add-branch')?.addEventListener('click', () => addNode('BRANCH'));
+  el('tree-add-constraint')?.addEventListener('click', () => addNode('CONSTRAINT'));
+  el('tree-add-success')?.addEventListener('click', () => addNode('SUCCESS'));
+  el('content').querySelectorAll('[data-tree-status]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      if (!intent) return;
+      try {
+        const data = await api('PATCH', `/v1/forge/intents/${encodeURIComponent(intent.id)}/tree/nodes/${encodeURIComponent(btn.dataset.treeStatus)}`, {
+          body: { status: btn.dataset.status },
+          idempotencyKey: `tree-st:${btn.dataset.treeStatus}:${btn.dataset.status}`,
+        });
+        state.intentTree = data.tree;
+        await refreshIntents();
+        renderTree();
+      } catch (error) { toast(error.message); }
+    });
   });
 }
 
@@ -834,6 +1039,11 @@ function renderCreate() {
         ${constraintsEditorHtml(defaults, { idPrefix: 'c', editable: true })}
       </div>
       <div class="field"><span>${tt('stakeAmount')}</span><input id="c-stake" type="number" min="1" value="50"></div>
+      <div class="field"><span>${tt('createScenario')}</span>
+        <select id="c-scenario">
+          ${SCENARIOS.map((s) => `<option value="${s}" ${state.scenarioMode === s ? 'selected' : ''}>${scenarioLabel(s)}</option>`).join('')}
+        </select>
+      </div>
       <div class="field"><span>${tt('adapter')}</span>
         <select id="c-adapter">${(adapters.length ? adapters : [{ adapterId: 'mfg-fab' }]).map((a) => `<option value="${a.adapterId}">${a.adapterId}</option>`).join('')}</select>
       </div>
@@ -845,6 +1055,7 @@ function renderCreate() {
     if (!statement) return toast(tt('statement'));
     const constraints = readConstraintsFromEditor(document.getElementById('c-editor'));
     const id = `forge:${crypto.randomUUID()}`;
+    const scenario = el('c-scenario').value || state.scenarioMode;
     try {
       await api('POST', '/v1/forge/intents', {
         body: {
@@ -853,15 +1064,18 @@ function renderCreate() {
           constraints,
           stake: Number(el('c-stake').value),
           adapter_id: el('c-adapter').value,
+          scenario,
         },
         idempotencyKey: `create:${id}`,
       });
       state.selectedIntentId = id;
+      state.scenarioMode = scenario;
       localStorage.setItem('forge.intent', id);
+      localStorage.setItem('forge.scenario', scenario);
       await refreshIntents();
       await refreshAccount();
       toast(tt('submitCreate'));
-      navigate('workbench');
+      navigate('tree');
     } catch (error) {
       toast(error.message);
     }
@@ -1536,6 +1750,7 @@ function renderHistory() {
 function renderPage() {
   const map = {
     overview: renderOverview,
+    tree: renderTree,
     workbench: renderWorkbench,
     collab: renderCollab,
     discover: renderDiscover,
@@ -1554,6 +1769,14 @@ function renderPage() {
       const intent = selectedIntent();
       if (intent) await refreshMemories(intent.id);
       renderWorkbench();
+    })();
+    return;
+  }
+  if (state.page === 'tree') {
+    void (async () => {
+      const intent = selectedIntent();
+      if (intent) await refreshIntentTree(intent.id);
+      renderTree();
     })();
     return;
   }
