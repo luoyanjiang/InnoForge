@@ -30,6 +30,7 @@ import {
   type ForgeTimelineItem,
   type ForgeCreditAllocation,
   type ForgeAllocationWeights,
+  type ForgeReputation,
   DEFAULT_ALLOCATION_WEIGHTS,
 } from './forge-loop.js';
 import {
@@ -43,6 +44,10 @@ import {
   computeCreditAllocations,
   type ForgeAllocationRole,
 } from './forge-allocations.js';
+import {
+  buildReputation,
+  computeReputationScore,
+} from './forge-reputation.js';
 
 type JudgmentRow = {
   id: string;
@@ -118,6 +123,41 @@ export class PostgresForgeLoopService implements ForgeLoopService {
     return account;
   }
 
+  private async reputationFor(tenantId: string, principalId: string): Promise<ForgeReputation> {
+    const result = await this.pool.query<{
+      actor_id: string;
+      action: 'ADOPT' | 'REJECT';
+      intent_status: string;
+    }>(
+      `SELECT j.actor_id, j.action, i.status AS intent_status
+         FROM forge_judgments j
+         JOIN forge_intents i ON i.id = j.intent_id
+        WHERE j.tenant_id = $1`,
+      [tenantId],
+    );
+    const countsByPrincipal = new Map<string, { adoptSettled: number; rejects: number }>();
+    for (const row of result.rows) {
+      const current = countsByPrincipal.get(row.actor_id) ?? { adoptSettled: 0, rejects: 0 };
+      if (row.action === 'REJECT') current.rejects += 1;
+      if (row.action === 'ADOPT' && row.intent_status === 'SETTLED') current.adoptSettled += 1;
+      countsByPrincipal.set(row.actor_id, current);
+    }
+    const peerScores = new Map<string, number>();
+    for (const [id, counts] of countsByPrincipal) {
+      peerScores.set(id, computeReputationScore({
+        adoptSettledCount: counts.adoptSettled,
+        rejectCount: counts.rejects,
+      }));
+    }
+    const self = countsByPrincipal.get(principalId) ?? { adoptSettled: 0, rejects: 0 };
+    return buildReputation({
+      principalId,
+      adoptSettledCount: self.adoptSettled,
+      rejectCount: self.rejects,
+      peerScores,
+    });
+  }
+
   async getAccount(input: { tenantId: string; principalId: string }): Promise<CreditAccount | undefined> {
     const result = await this.pool.query<{ balance: string; staked: string }>(
       `SELECT balance::text, staked::text FROM forge_credit_accounts
@@ -131,6 +171,7 @@ export class PostgresForgeLoopService implements ForgeLoopService {
       principalId: input.principalId,
       balance: Number(row.balance),
       staked: Number(row.staked),
+      reputation: await this.reputationFor(input.tenantId, input.principalId),
     });
   }
 

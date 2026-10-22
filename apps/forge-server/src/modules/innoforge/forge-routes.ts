@@ -152,7 +152,7 @@ export function registerForgeRoutes(app: FastifyInstance, service: ForgeLoopServ
   app.get<{ Headers: Pick<Headers, 'x-actor-id' | 'x-tenant-id'> }>('/v1/forge/accounts/me', {
     schema: {
       operationId: 'getForgeAccount',
-      summary: 'Read Credit balance for the calling principal',
+      summary: 'Read Credit balance + judgment reputation for the calling principal (G5)',
       tags: ['InnoForge'],
       headers: readHeaders,
       response: { 200: response, 404: errorResponse },

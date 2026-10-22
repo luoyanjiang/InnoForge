@@ -312,17 +312,25 @@ function impactLabel(impact) {
   return tt('impactExplore');
 }
 
+function reputationSubtext(rep) {
+  if (!rep) return tt('reputationUnknown');
+  if (rep.topPercent == null) return tt('reputationSampleThin');
+  return tt('reputationTop').replace('{n}', String(rep.topPercent));
+}
+
 function renderOverview() {
   setHeader(tt('overviewEyebrow'), `${tt('welcome')}, Alex.`, '');
   const active = state.intents.filter((i) => i.status !== 'SETTLED' && i.status !== 'REJECTED');
   const projects = state.intents.slice(0, 5);
+  const rep = state.account?.reputation;
+  const score = rep?.score ?? '—';
   el('page-title').innerHTML = `<span class="hero-brand">InnoForge</span>`;
   el('page-sub').textContent = `${tt('welcomeBack')}, Alex.`;
   el('content').innerHTML = `
     <div class="grid-3">
       <div class="panel"><div class="stat-label">${tt('activeIntents')}</div><div class="stat-value">${active.length} ${tt('activeCount')}</div></div>
       <div class="panel"><div class="stat-label">${tt('credit')}</div><div class="stat-value cyan">${state.account?.balance ?? '—'}</div><div class="stat-sub">${tt('staked')} ${state.account?.staked ?? 0}</div></div>
-      <div class="panel"><div class="stat-label">${tt('reputation')}</div><div class="stat-value">842</div><div class="stat-sub" style="color:var(--cyan)">${tt('topPct')}</div></div>
+      <div class="panel" id="reputation-card"><div class="stat-label">${tt('reputation')}</div><div class="stat-value">${score}</div><div class="stat-sub" style="color:var(--cyan)">${reputationSubtext(rep)}</div></div>
     </div>
     <div class="panel" style="margin-top:0.85rem">
       <div style="display:flex;justify-content:space-between;align-items:center"><h3>${tt('projects')}</h3><a href="#discover" id="to-discover">${tt('discoverMore')}</a></div>
