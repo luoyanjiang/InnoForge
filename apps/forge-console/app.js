@@ -457,6 +457,7 @@ function navigate(page) {
     studioMount.destroy();
     studioMount = null;
   }
+  if (page !== 'studio') document.body.classList.remove('studio-mode');
   state.page = page;
   localStorage.setItem('forge.page', page);
   el('sidebar').classList.remove('open');
@@ -1129,8 +1130,6 @@ function renderTasks() {
     <div class="panel scenario-banner">
       <div class="stat-label">${tt('scenarioWorkspace')}</div>
       <div class="stat-value cyan" style="font-size:1.1rem">${scenarioLabel(scenario)}</div>
-      <p class="empty">${tt('tasksHint')}</p>
-      <p class="empty">${tt('tasksBelongProject')}</p>
       <div class="btn-row"><button type="button" class="btn btn-cyan" id="tasks-to-studio">${tt('tasksOpenStudio')}</button></div>
     </div>
     <div class="panel">
@@ -2111,9 +2110,11 @@ function renderHistory() {
 }
 
 async function renderStudio() {
-  setHeader(tt('studioEyebrow'), tt('studioTitle'), tt('studioSub'));
+  // Studio speaks via workbench chrome — no instructional page sub.
+  setHeader('', tt('studioTitle'), '');
+  document.body.classList.add('studio-mode');
   const content = el('content');
-  content.innerHTML = `<div class="studio-host" id="studio-host"><p class="empty">${tt('studioLoading')}</p></div>`;
+  content.innerHTML = `<div class="studio-host" id="studio-host"></div>`;
   if (studioMount) {
     studioMount.destroy();
     studioMount = null;
