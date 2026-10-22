@@ -1,27 +1,100 @@
 import { t } from './i18n.js';
 
-const NAV = [
-  ['overview', 'navOverview'],
-  ['tree', 'navTree'],
-  ['workbench', 'navWorkbench'],
-  ['collab', 'navCollab'],
-  ['discover', 'navDiscover'],
-  ['create', 'navCreate'],
-  ['deploy', 'navDeploy'],
-  ['market', 'navMarket'],
-  ['account', 'navAccount'],
-  ['connections', 'navConnections'],
-  ['governance', 'navGovernance'],
-  ['equity', 'navEquity'],
-  ['history', 'navHistory'],
+/** Create-flow OS nav groups — not a flat toolbox. */
+const NAV_GROUPS = [
+  {
+    id: 'intent',
+    labelKey: 'navGroupIntent',
+    items: [
+      ['tree', 'navTree'],
+      ['workbench', 'navWorkbench'],
+      ['create', 'navCreate'],
+    ],
+  },
+  {
+    id: 'collab',
+    labelKey: 'navGroupCollab',
+    items: [['collab', 'navCollab']],
+  },
+  {
+    id: 'tasks',
+    labelKey: 'navGroupTasks',
+    items: [['tasks', 'navTasks']],
+  },
+  {
+    id: 'verify',
+    labelKey: 'navGroupVerify',
+    items: [
+      ['deploy', 'navDeploy'],
+      ['discover', 'navDiscover'],
+    ],
+  },
+  {
+    id: 'spaces',
+    labelKey: 'navGroupSpaces',
+    items: [
+      ['spaces', 'navSpaces'],
+      ['market', 'navMarket'],
+    ],
+  },
+  {
+    id: 'econ',
+    labelKey: 'navGroupEcon',
+    items: [
+      ['equity', 'navEquity'],
+      ['governance', 'navGovernance'],
+      ['history', 'navHistory'],
+      ['overview', 'navOverview'],
+      ['account', 'navAccount'],
+      ['connections', 'navConnections'],
+    ],
+  },
 ];
 
 const COLLAB_STAGES = ['DRAFT', 'EXPLORING', 'VALIDATING', 'COMMITTED'];
 const SCENARIOS = ['PRODUCT', 'RESEARCH', 'HARDWARE'];
+const TASK_STATUS_ORDER = ['PENDING', 'ASSIGNED', 'IN_PROGRESS', 'REVIEW', 'DONE'];
+const COLLAB_AGENTS = [
+  ['research', 'agentResearch'],
+  ['design', 'agentDesign'],
+  ['sim', 'agentSim'],
+  ['critique', 'agentCritique'],
+  ['orchestrate', 'agentOrchestrate'],
+];
+
+const SCENARIO_PLUGIN = {
+  PRODUCT: {
+    zh: { label: '产品原型', hint: '插件入口（模拟）：交互原型与增长指标 — 未接真实设计工具链。' },
+    en: { label: 'Product prototype', hint: 'Plugin entry (sim): interactive prototype + growth metrics — no design toolchain.' },
+  },
+  RESEARCH: {
+    zh: { label: '文献 · 假设', hint: '插件入口（模拟）：文献检索与假设可证伪性检查 — 未接真实文献库。' },
+    en: { label: 'Literature · Hypothesis', hint: 'Plugin entry (sim): lit search + falsifiability — no real literature DB.' },
+  },
+  HARDWARE: {
+    zh: { label: '仿真编排', hint: '插件入口（模拟）：结构/流体仿真编排 — 未接 FreeCAD / OpenFOAM。' },
+    en: { label: 'Sim orchestration', hint: 'Plugin entry (sim): structural/fluid orchestration — FreeCAD/OpenFOAM not wired.' },
+  },
+};
+
+const SCENARIO_SEED_TITLES = {
+  PRODUCT: {
+    zh: ['用户问题框定', '交互原型迭代', '增长指标定义'],
+    en: ['User problem framing', 'Interactive prototype pass', 'Growth metric definition'],
+  },
+  RESEARCH: {
+    zh: ['文献缺口扫描', '假设可证伪性检查', '实验设计草案'],
+    en: ['Literature gap scan', 'Hypothesis falsifiability check', 'Experiment design draft'],
+  },
+  HARDWARE: {
+    zh: ['约束包冻结', '结构仿真批次', 'DFM / BOM 估算'],
+    en: ['Constraint pack freeze', 'Structural sim batch', 'DFM / BOM estimate'],
+  },
+};
 
 const state = {
   locale: localStorage.getItem('forge.locale') || 'zh',
-  page: localStorage.getItem('forge.page') || 'overview',
+  page: localStorage.getItem('forge.page') || 'tree',
   tenantId: localStorage.getItem('forge.tenant') || 'tenant.demo',
   actorId: localStorage.getItem('forge.actor') || 'user.demo',
   scenarioMode: localStorage.getItem('forge.scenario') || 'PRODUCT',
@@ -31,6 +104,9 @@ const state = {
   editingIntent: null,
   selectedIntentId: localStorage.getItem('forge.intent') || null,
   intentTree: null,
+  selectedTreeNodeId: null,
+  tasks: [],
+  spaces: null,
   variants: [],
   judgments: [],
   timeline: [],
@@ -319,6 +395,31 @@ function nextCollabStage(current) {
   return COLLAB_STAGES[idx + 1];
 }
 
+function scenarioPlugin(scenario) {
+  const pack = SCENARIO_PLUGIN[scenario] || SCENARIO_PLUGIN.PRODUCT;
+  return pack[state.locale === 'en' ? 'en' : 'zh'];
+}
+
+function seedTaskTitles(scenario) {
+  const pack = SCENARIO_SEED_TITLES[scenario] || SCENARIO_SEED_TITLES.PRODUCT;
+  return pack[state.locale === 'en' ? 'en' : 'zh'];
+}
+
+function taskStatusLabel(status) {
+  if (status === 'ASSIGNED') return tt('taskStatusAssigned');
+  if (status === 'IN_PROGRESS') return tt('taskStatusProgress');
+  if (status === 'REVIEW') return tt('taskStatusReview');
+  if (status === 'DONE') return tt('taskStatusDone');
+  if (status === 'FAILED') return tt('taskStatusFailed');
+  return tt('taskStatusPending');
+}
+
+function nextTaskStatus(current) {
+  const idx = TASK_STATUS_ORDER.indexOf(current || 'PENDING');
+  if (idx < 0 || idx >= TASK_STATUS_ORDER.length - 1) return null;
+  return TASK_STATUS_ORDER[idx + 1];
+}
+
 function renderNav() {
   const nav = el('nav');
   nav.innerHTML = `
@@ -330,10 +431,15 @@ function renderNav() {
             ${scenarioLabel(s)}
           </button>`).join('')}
       </div>
+      <div class="scenario-workspace-chip">${tt('scenarioWorkspace')} · ${scenarioLabel(state.scenarioMode)}</div>
     </div>
-    ${NAV.map(([id, key]) => (
-      `<button type="button" class="nav-item${state.page === id ? ' active' : ''}" data-page="${id}">${tt(key)}</button>`
-    )).join('')}`;
+    ${NAV_GROUPS.map((group) => `
+      <div class="nav-group" data-group="${group.id}">
+        <div class="nav-group-label">${tt(group.labelKey)}</div>
+        ${group.items.map(([id, key]) => (
+          `<button type="button" class="nav-item${state.page === id ? ' active' : ''}" data-page="${id}">${tt(key)}</button>`
+        )).join('')}
+      </div>`).join('')}`;
   nav.querySelectorAll('.nav-item').forEach((btn) => {
     btn.addEventListener('click', () => navigate(btn.dataset.page));
   });
@@ -750,9 +856,29 @@ function renderCollab() {
   const intent = selectedIntent();
   const stage = intent?.collabStage || 'DRAFT';
   const next = nextCollabStage(stage);
+  const scenario = intent?.scenario || state.scenarioMode;
+  const stageIdx = COLLAB_STAGES.indexOf(stage);
   el('content').innerHTML = `
+    <div class="panel scenario-banner">
+      <div class="stat-label">${tt('scenarioWorkspace')}</div>
+      <div class="stat-value cyan" style="font-size:1.15rem">${scenarioLabel(scenario)}</div>
+    </div>
+    <div class="panel" id="collab-agents-panel">
+      <h3>${tt('collabAgentsTitle')}</h3>
+      <p class="empty">${tt('collabAgentsHint')}</p>
+      <div class="agent-strip">
+        ${COLLAB_AGENTS.map(([id, key], index) => {
+          const active = index <= Math.max(stageIdx, 0);
+          return `
+            <div class="agent-chip ${active ? 'on' : ''}" data-agent="${id}">
+              <span class="agent-name">${tt(key)}</span>
+              <span class="badge ${active ? 'cyan' : ''}">${active ? tt('agentActive') : tt('agentStandby')}</span>
+            </div>`;
+        }).join('')}
+      </div>
+    </div>
     <div class="panel" id="collab-stage-panel">
-      <h3>${tt('collabStageTitle')} · ${scenarioLabel(intent?.scenario || state.scenarioMode)}</h3>
+      <h3>${tt('collabStageTitle')} · ${scenarioLabel(scenario)}</h3>
       <p class="empty">${tt('collabStageHint')}</p>
       <div class="stage-rail collab-stage-rail">
         ${COLLAB_STAGES.map((s) => `<span class="${stage === s ? 'on' : ''}">${stageLabel(s)}</span>`).join('')}
@@ -840,7 +966,7 @@ async function refreshIntentTree(intentId) {
   }
 }
 
-function renderTreeNodes(nodes) {
+function renderTreeNodes(nodes, selectedId) {
   const byParent = new Map();
   for (const node of nodes || []) {
     const key = node.parentId || '';
@@ -850,18 +976,12 @@ function renderTreeNodes(nodes) {
   const walk = (parentId, depth) => {
     const kids = byParent.get(parentId || '') || [];
     return kids.map((node) => `
-      <div class="tree-node" style="margin-left:${depth * 1.1}rem">
-        <div class="list-row">
-          <div>
-            <div><span class="badge cyan">${treeKindLabel(node.kind)}</span> ${escapeAttr(node.title)}</div>
-            <div class="stat-sub">${treeStatusLabel(node.status)} · <span class="mono">${escapeAttr(node.id.slice(0, 16))}</span></div>
-          </div>
-          <div class="btn-row">
-            <button type="button" class="btn btn-ghost" data-tree-status="${escapeAttr(node.id)}" data-status="ALIGNED">${tt('treeAlign')}</button>
-            <button type="button" class="btn btn-ghost" data-tree-status="${escapeAttr(node.id)}" data-status="CONFLICT">${tt('treeConflict')}</button>
-            <button type="button" class="btn btn-cyan" data-tree-status="${escapeAttr(node.id)}" data-status="DONE">${tt('treeDone')}</button>
-          </div>
-        </div>
+      <div class="tree-node ${selectedId === node.id ? 'selected' : ''}" style="margin-left:${depth * 1.05}rem">
+        <button type="button" class="tree-node-btn" data-tree-select="${escapeAttr(node.id)}">
+          <span class="badge cyan">${treeKindLabel(node.kind)}</span>
+          <span class="tree-node-title">${escapeAttr(node.title)}</span>
+          <span class="stat-sub">${treeStatusLabel(node.status)}</span>
+        </button>
         ${walk(node.id, depth + 1)}
       </div>`).join('');
   };
@@ -869,12 +989,37 @@ function renderTreeNodes(nodes) {
 }
 
 function renderTree() {
-  setHeader(tt('navTree'), tt('treeTitle'), tt('treeSub'));
   const intent = selectedIntent();
+  const scenario = intent?.scenario || state.scenarioMode;
+  const plugin = scenarioPlugin(scenario);
+  setHeader(
+    `${tt('navTree')} · ${scenarioLabel(scenario)}`,
+    tt('treeTitle'),
+    tt('treeSub'),
+  );
   const tree = state.intentTree || intent?.intentTree;
-  const roots = (tree?.nodes || []).filter((n) => !n.parentId);
+  const nodes = tree?.nodes || [];
+  const roots = nodes.filter((n) => !n.parentId);
   const rootId = roots[0]?.id || null;
+  if (state.selectedTreeNodeId && !nodes.some((n) => n.id === state.selectedTreeNodeId)) {
+    state.selectedTreeNodeId = null;
+  }
+  const selected = nodes.find((n) => n.id === state.selectedTreeNodeId) || nodes[0] || null;
+  if (selected && state.selectedTreeNodeId !== selected.id) {
+    state.selectedTreeNodeId = selected.id;
+  }
   el('content').innerHTML = `
+    <div class="panel scenario-banner tree-scenario-banner">
+      <div>
+        <div class="stat-label">${tt('scenarioWorkspace')}</div>
+        <div class="stat-value cyan" style="font-size:1.2rem">${scenarioLabel(scenario)}</div>
+      </div>
+      <div class="plugin-hint">
+        <div class="stat-label">${tt('pluginEntry')}</div>
+        <div><strong>${escapeAttr(plugin.label)}</strong></div>
+        <p class="empty" style="margin:0.35rem 0 0">${escapeAttr(plugin.hint)}</p>
+      </div>
+    </div>
     <div class="panel" id="intent-tree-panel">
       <p class="empty">${tt('treeHint')}</p>
       <label class="field"><span>${tt('treeTitle')}</span>
@@ -891,12 +1036,38 @@ function renderTree() {
         <button type="button" class="btn btn-ghost" id="tree-add-constraint" ${intent && rootId ? '' : 'disabled'}>${tt('treeAddConstraint')}</button>
         <button type="button" class="btn btn-ghost" id="tree-add-success" ${intent && rootId ? '' : 'disabled'}>${tt('treeAddSuccess')}</button>
       </div>
-      <div id="tree-list" style="margin-top:0.85rem">
-        ${intent ? renderTreeNodes(tree?.nodes || []) : `<p class="empty">${tt('treeEmpty')}</p>`}
+      <div class="tree-workspace">
+        <div class="tree-canvas panel-inset">
+          <h3>${tt('treeCanvas')}</h3>
+          <div id="tree-list">
+            ${intent ? renderTreeNodes(nodes, selected?.id) : `<p class="empty">${tt('treeEmpty')}</p>`}
+          </div>
+        </div>
+        <div class="tree-detail panel-inset">
+          <h3>${tt('treeDetail')}</h3>
+          ${selected ? `
+            <div class="list-row">
+              <div>
+                <div><span class="badge cyan">${treeKindLabel(selected.kind)}</span> ${escapeAttr(selected.title)}</div>
+                <div class="stat-sub">${treeStatusLabel(selected.status)} · <span class="mono">${escapeAttr(selected.id.slice(0, 20))}</span></div>
+              </div>
+            </div>
+            <div class="btn-row" style="margin-top:0.75rem">
+              <button type="button" class="btn btn-ghost" data-tree-status="${escapeAttr(selected.id)}" data-status="ALIGNED">${tt('treeAlign')}</button>
+              <button type="button" class="btn btn-ghost" data-tree-status="${escapeAttr(selected.id)}" data-status="CONFLICT">${tt('treeConflict')}</button>
+              <button type="button" class="btn btn-cyan" data-tree-status="${escapeAttr(selected.id)}" data-status="DONE">${tt('treeDone')}</button>
+            </div>
+            <div class="plugin-hint" style="margin-top:1rem">
+              <div class="stat-label">${tt('pluginEntry')} · ${scenarioLabel(scenario)}</div>
+              <p class="empty">${escapeAttr(plugin.hint)}</p>
+            </div>
+          ` : `<p class="empty">${tt('treeSelectNode')}</p>`}
+        </div>
       </div>
     </div>`;
   el('tree-intent')?.addEventListener('change', async (event) => {
     state.selectedIntentId = event.target.value || null;
+    state.selectedTreeNodeId = null;
     if (state.selectedIntentId) localStorage.setItem('forge.intent', state.selectedIntentId);
     await refreshIntentTree(state.selectedIntentId);
     renderTree();
@@ -919,6 +1090,12 @@ function renderTree() {
   el('tree-add-branch')?.addEventListener('click', () => addNode('BRANCH'));
   el('tree-add-constraint')?.addEventListener('click', () => addNode('CONSTRAINT'));
   el('tree-add-success')?.addEventListener('click', () => addNode('SUCCESS'));
+  el('content').querySelectorAll('[data-tree-select]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.selectedTreeNodeId = btn.dataset.treeSelect;
+      renderTree();
+    });
+  });
   el('content').querySelectorAll('[data-tree-status]').forEach((btn) => {
     btn.addEventListener('click', async () => {
       if (!intent) return;
@@ -931,6 +1108,203 @@ function renderTree() {
         await refreshIntents();
         renderTree();
       } catch (error) { toast(error.message); }
+    });
+  });
+}
+
+async function refreshTasks(intentId) {
+  if (!intentId) {
+    state.tasks = [];
+    return;
+  }
+  try {
+    const data = await api('GET', `/v1/forge/intents/${encodeURIComponent(intentId)}/tasks`);
+    state.tasks = data.tasks || [];
+  } catch {
+    state.tasks = [];
+  }
+}
+
+async function refreshSpaces() {
+  try {
+    state.spaces = await api('GET', `/v1/forge/spaces?locale=${encodeURIComponent(state.locale === 'en' ? 'en' : 'zh')}`);
+  } catch {
+    state.spaces = null;
+  }
+}
+
+function renderTasks() {
+  const intent = selectedIntent();
+  const scenario = intent?.scenario || state.scenarioMode;
+  setHeader(`${tt('navTasks')} · ${scenarioLabel(scenario)}`, tt('tasksTitle'), tt('tasksSub'));
+  const tree = state.intentTree || intent?.intentTree;
+  const nodes = tree?.nodes || [];
+  el('content').innerHTML = `
+    <div class="panel scenario-banner">
+      <div class="stat-label">${tt('scenarioWorkspace')}</div>
+      <div class="stat-value cyan" style="font-size:1.1rem">${scenarioLabel(scenario)}</div>
+      <p class="empty">${tt('tasksHint')}</p>
+    </div>
+    <div class="panel">
+      <label class="field"><span>${tt('navTasks')}</span>
+        <select id="tasks-intent">
+          ${state.intents.map((i) => `
+            <option value="${escapeAttr(i.id)}" ${i.id === intent?.id ? 'selected' : ''}>
+              ${escapeAttr(i.statement.slice(0, 48))} · ${scenarioLabel(i.scenario || 'PRODUCT')}
+            </option>`).join('') || `<option value="">${tt('emptyIntents')}</option>`}
+        </select>
+      </label>
+      <div class="btn-row tasks-create-row">
+        <input id="task-title" placeholder="${tt('tasksTitlePh')}" ${intent ? '' : 'disabled'}>
+        <select id="task-executor" ${intent ? '' : 'disabled'}>
+          <option value="AI">${tt('tasksExecutorAi')}</option>
+          <option value="HUMAN">${tt('tasksExecutorHuman')}</option>
+        </select>
+        <select id="task-node" ${intent ? '' : 'disabled'}>
+          <option value="">${tt('tasksUnbound')}</option>
+          ${nodes.map((n) => `
+            <option value="${escapeAttr(n.id)}">${escapeAttr(treeKindLabel(n.kind))} · ${escapeAttr(n.title.slice(0, 32))}</option>
+          `).join('')}
+        </select>
+        <button type="button" class="btn btn-primary" id="task-add" ${intent ? '' : 'disabled'}>${tt('tasksAdd')}</button>
+        <button type="button" class="btn btn-ghost" id="task-seed" ${intent ? '' : 'disabled'}>${tt('tasksSeed')}</button>
+      </div>
+      <div class="tasks-list" style="margin-top:0.85rem">
+        ${state.tasks.length ? state.tasks.map((task) => {
+          const next = nextTaskStatus(task.status);
+          const node = nodes.find((n) => n.id === task.treeNodeId);
+          return `
+            <div class="list-row task-row">
+              <div>
+                <div><strong>${escapeAttr(task.title)}</strong>
+                  <span class="badge cyan">${task.executor === 'HUMAN' ? tt('tasksExecutorHuman') : tt('tasksExecutorAi')}</span>
+                  <span class="badge">${taskStatusLabel(task.status)}</span>
+                </div>
+                <div class="stat-sub">
+                  ${node ? `${tt('tasksBindNode')}: ${escapeAttr(node.title)}` : tt('tasksUnbound')}
+                  · <span class="mono">${escapeAttr(task.id.slice(0, 16))}</span>
+                </div>
+              </div>
+              <div class="btn-row">
+                <button type="button" class="btn btn-cyan" data-task-advance="${escapeAttr(task.id)}" data-next="${next || ''}" ${next ? '' : 'disabled'}>
+                  ${next ? `${tt('tasksAdvance')} → ${taskStatusLabel(next)}` : tt('taskStatusDone')}
+                </button>
+                <button type="button" class="btn btn-ghost" data-task-fail="${escapeAttr(task.id)}" ${task.status === 'DONE' || task.status === 'FAILED' ? 'disabled' : ''}>
+                  ${tt('tasksFail')}
+                </button>
+              </div>
+            </div>`;
+        }).join('') : `<p class="empty">${tt('tasksEmpty')}</p>`}
+      </div>
+    </div>`;
+  el('tasks-intent')?.addEventListener('change', async (event) => {
+    state.selectedIntentId = event.target.value || null;
+    if (state.selectedIntentId) localStorage.setItem('forge.intent', state.selectedIntentId);
+    await refreshIntentTree(state.selectedIntentId);
+    await refreshTasks(state.selectedIntentId);
+    renderTasks();
+  });
+  el('task-add')?.addEventListener('click', async () => {
+    if (!intent) return;
+    const title = el('task-title')?.value?.trim();
+    if (!title) return toast(tt('tasksTitlePh'));
+    const executor = el('task-executor')?.value || 'AI';
+    const treeNodeId = el('task-node')?.value || null;
+    try {
+      await api('POST', `/v1/forge/intents/${encodeURIComponent(intent.id)}/tasks`, {
+        body: {
+          title,
+          executor,
+          ...(treeNodeId ? { tree_node_id: treeNodeId } : { tree_node_id: null }),
+        },
+        idempotencyKey: `task:${intent.id}:${Date.now()}`,
+      });
+      el('task-title').value = '';
+      await refreshTasks(intent.id);
+      renderTasks();
+    } catch (error) { toast(error.message); }
+  });
+  el('task-seed')?.addEventListener('click', async () => {
+    if (!intent) return;
+    const titles = seedTaskTitles(scenario);
+    const root = nodes.find((n) => !n.parentId);
+    try {
+      for (const [index, title] of titles.entries()) {
+        await api('POST', `/v1/forge/intents/${encodeURIComponent(intent.id)}/tasks`, {
+          body: {
+            title,
+            executor: index % 2 === 0 ? 'AI' : 'HUMAN',
+            ...(root ? { tree_node_id: root.id } : {}),
+          },
+          idempotencyKey: `task-seed:${intent.id}:${scenario}:${index}:${Date.now()}`,
+        });
+      }
+      await refreshTasks(intent.id);
+      renderTasks();
+    } catch (error) { toast(error.message); }
+  });
+  el('content').querySelectorAll('[data-task-advance]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      if (!intent || !btn.dataset.next) return;
+      try {
+        await api('PATCH', `/v1/forge/intents/${encodeURIComponent(intent.id)}/tasks/${encodeURIComponent(btn.dataset.taskAdvance)}`, {
+          body: { status: btn.dataset.next },
+          idempotencyKey: `task-adv:${btn.dataset.taskAdvance}:${btn.dataset.next}`,
+        });
+        await refreshTasks(intent.id);
+        renderTasks();
+      } catch (error) { toast(error.message); }
+    });
+  });
+  el('content').querySelectorAll('[data-task-fail]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      if (!intent) return;
+      try {
+        await api('PATCH', `/v1/forge/intents/${encodeURIComponent(intent.id)}/tasks/${encodeURIComponent(btn.dataset.taskFail)}`, {
+          body: { status: 'FAILED' },
+          idempotencyKey: `task-fail:${btn.dataset.taskFail}`,
+        });
+        await refreshTasks(intent.id);
+        renderTasks();
+      } catch (error) { toast(error.message); }
+    });
+  });
+}
+
+function renderSpaceColumn(title, assets, spaceKey) {
+  return `
+    <div class="panel space-column">
+      <h3>${title}</h3>
+      ${(assets || []).length ? assets.map((asset) => `
+        <div class="list-row">
+          <div>
+            <div>${escapeAttr(asset.title)}</div>
+            <div class="stat-sub"><span class="badge">${escapeAttr(asset.kind)}</span>
+              ${(asset.updatedAt || '').slice(0, 10)}</div>
+          </div>
+        </div>`).join('') : `<p class="empty">${tt('spacesEmpty')}</p>`}
+      <button type="button" class="btn btn-primary" data-deposit="${spaceKey}" style="margin-top:0.75rem;width:100%">
+        ${tt('spacesDeposit')}
+      </button>
+    </div>`;
+}
+
+function renderSpaces() {
+  setHeader(tt('navSpaces'), tt('spacesTitle'), tt('spacesSub'));
+  const spaces = state.spaces;
+  el('content').innerHTML = `
+    <div class="panel">
+      <p class="empty">${tt('spacesHint')}</p>
+      ${spaces?.note ? `<p class="stat-sub">${escapeAttr(spaces.note)}</p>` : ''}
+    </div>
+    <div class="spaces-grid">
+      ${renderSpaceColumn(tt('spacesPersonal'), spaces?.personal, 'personal')}
+      ${renderSpaceColumn(tt('spacesTeam'), spaces?.team, 'team')}
+      ${renderSpaceColumn(tt('spacesProject'), spaces?.project, 'project')}
+    </div>`;
+  el('content').querySelectorAll('[data-deposit]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      toast(`${tt('spacesDeposited')} · ${btn.dataset.deposit}`);
     });
   });
 }
@@ -1753,6 +2127,8 @@ function renderPage() {
     tree: renderTree,
     workbench: renderWorkbench,
     collab: renderCollab,
+    tasks: renderTasks,
+    spaces: renderSpaces,
     discover: renderDiscover,
     create: renderCreate,
     deploy: renderDeploy,
@@ -1780,6 +2156,23 @@ function renderPage() {
     })();
     return;
   }
+  if (state.page === 'tasks') {
+    void (async () => {
+      const intent = selectedIntent();
+      if (intent) {
+        await refreshIntentTree(intent.id);
+        await refreshTasks(intent.id);
+      } else {
+        state.tasks = [];
+      }
+      renderTasks();
+    })();
+    return;
+  }
+  if (state.page === 'spaces') {
+    void refreshSpaces().then(() => renderSpaces());
+    return;
+  }
   if (state.page === 'history') {
     void refreshTimeline().then(() => renderHistory());
     return;
@@ -1800,7 +2193,7 @@ function renderPage() {
     void refreshLifeforms().then(() => renderDeploy());
     return;
   }
-  (map[state.page] || renderOverview)();
+  (map[state.page] || renderTree)();
 }
 
 el('lang-zh').addEventListener('click', () => {

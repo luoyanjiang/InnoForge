@@ -87,6 +87,18 @@ import {
   type ForgeTreeNodeKind,
   type ForgeTreeNodeStatus,
 } from './forge-intent-tree.js';
+import {
+  canAdvanceTaskStatus,
+  freezeTask,
+  newTaskId,
+  normalizeExecutor,
+  normalizeTaskStatus,
+  simSpacesView,
+  type ForgeSpacesView,
+  type ForgeTask,
+  type ForgeTaskExecutor,
+  type ForgeTaskStatus,
+} from './forge-tasks.js';
 
 type JudgmentRow = {
   id: string;
@@ -1561,6 +1573,176 @@ export class PostgresForgeLoopService implements ForgeLoopService {
       ...(row.confirmed_at ? { confirmedAt: new Date(row.confirmed_at).toISOString() } : {}),
       ...(row.settled_at ? { settledAt: new Date(row.settled_at).toISOString() } : {}),
       events: Object.freeze(mappedEvents),
+    });
+  }
+
+  private taskFromRow(row: {
+    id: string;
+    intent_id: string;
+    tenant_id: string;
+    tree_node_id: string | null;
+    title: string;
+    executor: string;
+    status: string;
+    created_at: Date | string;
+    updated_at: Date | string;
+    created_by: string;
+  }): ForgeTask {
+    return freezeTask({
+      id: row.id,
+      intentId: row.intent_id,
+      tenantId: row.tenant_id,
+      ...(row.tree_node_id ? { treeNodeId: row.tree_node_id } : {}),
+      title: row.title,
+      executor: normalizeExecutor(row.executor),
+      status: normalizeTaskStatus(row.status),
+      createdAt: new Date(row.created_at).toISOString(),
+      updatedAt: new Date(row.updated_at).toISOString(),
+      createdBy: row.created_by,
+    });
+  }
+
+  async createTask(input: {
+    intentId: string;
+    title: string;
+    executor?: ForgeTaskExecutor | string;
+    treeNodeId?: string | null;
+    audit: ForgeAudit;
+  }): Promise<ForgeTask> {
+    const intent = await this.requireIntent(input.intentId, input.audit.tenantId);
+    const title = input.title.trim();
+    if (!title) throw new ForgeLoopError('TASK_TITLE_REQUIRED');
+    const treeNodeId = input.treeNodeId === undefined || input.treeNodeId === null
+      ? null
+      : String(input.treeNodeId);
+    if (treeNodeId && !intent.intentTree.nodes.some((n) => n.id === treeNodeId)) {
+      throw new ForgeLoopError('TREE_NODE_NOT_FOUND');
+    }
+    const id = newTaskId();
+    const executor = normalizeExecutor(input.executor);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `INSERT INTO forge_tasks
+          (id, intent_id, tenant_id, tree_node_id, title, executor, status,
+           created_at, updated_at, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,'PENDING',$7::timestamptz,$7::timestamptz,$8)`,
+        [
+          id,
+          input.intentId,
+          input.audit.tenantId,
+          treeNodeId,
+          title,
+          executor,
+          input.audit.occurredAt,
+          input.audit.actorId,
+        ],
+      );
+      const payload = {
+        taskId: id,
+        title,
+        executor,
+        treeNodeId,
+      };
+      await this.insertEvent(client, input.intentId, 'forge.task.created', input.audit, payload);
+      await this.appendDomainEvent(client, input.intentId, 'forge.task.created', input.audit, payload);
+      await client.query(
+        `UPDATE forge_intents SET updated_at=$2::timestamptz WHERE id=$1`,
+        [input.intentId, input.audit.occurredAt],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    const created = await this.pool.query(`SELECT * FROM forge_tasks WHERE id=$1`, [id]);
+    if (!created.rows[0]) throw new ForgeLoopError('TASK_NOT_FOUND');
+    return this.taskFromRow(created.rows[0]);
+  }
+
+  async listTasks(input: {
+    intentId: string;
+    tenantId: string;
+  }): Promise<readonly ForgeTask[]> {
+    await this.requireIntent(input.intentId, input.tenantId);
+    const result = await this.pool.query(
+      `SELECT * FROM forge_tasks
+        WHERE intent_id=$1 AND tenant_id=$2
+        ORDER BY updated_at DESC, id`,
+      [input.intentId, input.tenantId],
+    );
+    return Object.freeze(result.rows.map((row) => this.taskFromRow(row)));
+  }
+
+  async updateTask(input: {
+    intentId: string;
+    taskId: string;
+    status?: ForgeTaskStatus | string;
+    executor?: ForgeTaskExecutor | string;
+    audit: ForgeAudit;
+  }): Promise<ForgeTask> {
+    const result = await this.pool.query(
+      `SELECT * FROM forge_tasks WHERE id=$1 AND intent_id=$2 AND tenant_id=$3`,
+      [input.taskId, input.intentId, input.audit.tenantId],
+    );
+    if (!result.rows[0]) throw new ForgeLoopError('TASK_NOT_FOUND');
+    const current = this.taskFromRow(result.rows[0]);
+    let nextStatus = current.status;
+    if (input.status !== undefined) {
+      const target = normalizeTaskStatus(input.status);
+      if (target !== current.status) {
+        if (!canAdvanceTaskStatus(current.status, target)) {
+          throw new ForgeLoopError('TASK_STATUS_INVALID');
+        }
+        nextStatus = target;
+      }
+    }
+    const nextExecutor = input.executor !== undefined
+      ? normalizeExecutor(input.executor)
+      : current.executor;
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE forge_tasks
+            SET status=$2, executor=$3, updated_at=$4::timestamptz
+          WHERE id=$1`,
+        [current.id, nextStatus, nextExecutor, input.audit.occurredAt],
+      );
+      const payload = {
+        taskId: current.id,
+        status: nextStatus,
+        executor: nextExecutor,
+        previousStatus: current.status,
+      };
+      await this.insertEvent(client, input.intentId, 'forge.task.updated', input.audit, payload);
+      await this.appendDomainEvent(client, input.intentId, 'forge.task.updated', input.audit, payload);
+      await client.query(
+        `UPDATE forge_intents SET updated_at=$2::timestamptz WHERE id=$1`,
+        [input.intentId, input.audit.occurredAt],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    const updated = await this.pool.query(`SELECT * FROM forge_tasks WHERE id=$1`, [current.id]);
+    if (!updated.rows[0]) throw new ForgeLoopError('TASK_NOT_FOUND');
+    return this.taskFromRow(updated.rows[0]);
+  }
+
+  async getSpaces(input: {
+    tenantId: string;
+    locale?: string;
+  }): Promise<ForgeSpacesView> {
+    return simSpacesView({
+      tenantId: input.tenantId,
+      ...(input.locale !== undefined ? { locale: input.locale } : {}),
     });
   }
 
