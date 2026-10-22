@@ -42,6 +42,15 @@ import {
   summarizeJudgments,
   type ForgeSnapshot,
 } from './forge-snapshots.js';
+import {
+  freezeLifeform,
+  freezeProposal,
+  lifeformIdFor,
+  newProposalId,
+  type ForgeLifeform,
+  type ForgeLifeformProposal,
+  type ForgeLifeformStatus,
+} from './forge-lifeforms.js';
 
 export type { ForgeConstraint } from './forge-constraints.js';
 export type { ForgeJudgment, ForgeJudgmentAction, ForgeVariantCandidate } from './forge-judgments.js';
@@ -55,6 +64,12 @@ export { DEFAULT_ALLOCATION_WEIGHTS } from './forge-allocations.js';
 export type { ForgeReputation } from './forge-reputation.js';
 export { REPUTATION_BASELINE } from './forge-reputation.js';
 export type { ForgeSnapshot } from './forge-snapshots.js';
+export type {
+  ForgeLifeform,
+  ForgeLifeformProposal,
+  ForgeLifeformProposalStatus,
+  ForgeLifeformStatus,
+} from './forge-lifeforms.js';
 
 export type ForgeLoopStatus =
   | 'DRAFT'
@@ -163,6 +178,29 @@ export interface ForgeLoopService {
     snapshotId: string;
     audit: ForgeAudit;
   }): Promise<ForgeIntent>;
+  createLifeform(input: {
+    intentId: string;
+    name?: string;
+    audit: ForgeAudit;
+  }): Promise<ForgeLifeform>;
+  listLifeforms(input: { tenantId: string }): Promise<readonly ForgeLifeform[]>;
+  getLifeform(input: { id: string; tenantId: string }): Promise<ForgeLifeform | undefined>;
+  addLifeformProposal(input: {
+    lifeformId: string;
+    summary: string;
+    audit: ForgeAudit;
+  }): Promise<ForgeLifeform>;
+  decideLifeformProposal(input: {
+    lifeformId: string;
+    proposalId: string;
+    decision: 'ACCEPTED' | 'REJECTED';
+    audit: ForgeAudit;
+  }): Promise<ForgeLifeform>;
+  setLifeformStatus(input: {
+    lifeformId: string;
+    status: Exclude<ForgeLifeformStatus, 'ACTIVE'> | 'ACTIVE';
+    audit: ForgeAudit;
+  }): Promise<ForgeLifeform>;
 }
 
 export class ForgeLoopError extends Error {
@@ -195,6 +233,7 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
   private readonly judgments = new Map<string, ForgeJudgment>();
   private readonly allocations = new Map<string, ForgeCreditAllocation[]>();
   private readonly snapshots = new Map<string, ForgeSnapshot>();
+  private readonly lifeforms = new Map<string, ForgeLifeform>();
   private readonly bridge: ForgePxnBridge;
 
   constructor(
@@ -862,6 +901,179 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
       events: Object.freeze([...record.events]),
     });
     return record.view;
+  }
+
+  private appendIntentEvent(
+    intentId: string,
+    audit: ForgeAudit,
+    type: string,
+    payload: Record<string, unknown>,
+  ): void {
+    const record = this.intents.get(intentId);
+    if (!record) return;
+    const ev = event(type, audit, payload);
+    record.events.push(ev);
+    record.view = Object.freeze({
+      ...record.view,
+      updatedAt: audit.occurredAt,
+      events: Object.freeze([...record.events]),
+    });
+  }
+
+  async createLifeform(input: {
+    intentId: string;
+    name?: string;
+    audit: ForgeAudit;
+  }): Promise<ForgeLifeform> {
+    const intent = await this.get({ id: input.intentId, tenantId: input.audit.tenantId });
+    if (!intent) throw new ForgeLoopError('INTENT_NOT_FOUND');
+    if (intent.status !== 'SETTLED') throw new ForgeLoopError('LIFEFORM_REQUIRES_SETTLED');
+    const id = lifeformIdFor(input.intentId);
+    const existing = this.lifeforms.get(id);
+    if (existing) return existing;
+    const lifeform = freezeLifeform({
+      id,
+      intentId: input.intentId,
+      tenantId: input.audit.tenantId,
+      name: (input.name?.trim() || intent.statement.slice(0, 64) || input.intentId),
+      status: 'ACTIVE',
+      proposals: [],
+      createdAt: input.audit.occurredAt,
+      updatedAt: input.audit.occurredAt,
+      createdBy: input.audit.actorId,
+    });
+    this.lifeforms.set(id, lifeform);
+    this.appendIntentEvent(input.intentId, input.audit, 'forge.lifeform.created', {
+      lifeformId: id,
+      name: lifeform.name,
+      status: lifeform.status,
+    });
+    return lifeform;
+  }
+
+  async listLifeforms(input: { tenantId: string }): Promise<readonly ForgeLifeform[]> {
+    return Object.freeze(
+      [...this.lifeforms.values()]
+        .filter((item) => item.tenantId === input.tenantId)
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)),
+    );
+  }
+
+  async getLifeform(input: { id: string; tenantId: string }): Promise<ForgeLifeform | undefined> {
+    const lifeform = this.lifeforms.get(input.id);
+    if (!lifeform || lifeform.tenantId !== input.tenantId) return undefined;
+    return lifeform;
+  }
+
+  async addLifeformProposal(input: {
+    lifeformId: string;
+    summary: string;
+    audit: ForgeAudit;
+  }): Promise<ForgeLifeform> {
+    const lifeform = this.lifeforms.get(input.lifeformId);
+    if (!lifeform || lifeform.tenantId !== input.audit.tenantId) {
+      throw new ForgeLoopError('LIFEFORM_NOT_FOUND');
+    }
+    if (lifeform.status !== 'ACTIVE') throw new ForgeLoopError('LIFEFORM_NOT_ACTIVE');
+    const summary = input.summary.trim();
+    if (!summary) throw new ForgeLoopError('PROPOSAL_SUMMARY_REQUIRED');
+    const proposal = freezeProposal({
+      id: newProposalId(),
+      summary,
+      status: 'PENDING',
+      createdAt: input.audit.occurredAt,
+    });
+    const next = freezeLifeform({
+      ...lifeform,
+      proposals: [...lifeform.proposals, proposal],
+      updatedAt: input.audit.occurredAt,
+    });
+    this.lifeforms.set(next.id, next);
+    this.appendIntentEvent(lifeform.intentId, input.audit, 'forge.lifeform.proposal_added', {
+      lifeformId: next.id,
+      proposalId: proposal.id,
+      summary: proposal.summary,
+    });
+    return next;
+  }
+
+  async decideLifeformProposal(input: {
+    lifeformId: string;
+    proposalId: string;
+    decision: 'ACCEPTED' | 'REJECTED';
+    audit: ForgeAudit;
+  }): Promise<ForgeLifeform> {
+    const lifeform = this.lifeforms.get(input.lifeformId);
+    if (!lifeform || lifeform.tenantId !== input.audit.tenantId) {
+      throw new ForgeLoopError('LIFEFORM_NOT_FOUND');
+    }
+    if (lifeform.status !== 'ACTIVE') throw new ForgeLoopError('LIFEFORM_NOT_ACTIVE');
+    const index = lifeform.proposals.findIndex((item) => item.id === input.proposalId);
+    if (index < 0) throw new ForgeLoopError('PROPOSAL_NOT_FOUND');
+    const current = lifeform.proposals[index]!;
+    if (current.status !== 'PENDING') throw new ForgeLoopError('PROPOSAL_ALREADY_DECIDED');
+    const decided = freezeProposal({
+      ...current,
+      status: input.decision,
+      decidedAt: input.audit.occurredAt,
+      decidedBy: input.audit.actorId,
+    });
+    const proposals = [...lifeform.proposals];
+    proposals[index] = decided;
+    const next = freezeLifeform({
+      ...lifeform,
+      proposals,
+      updatedAt: input.audit.occurredAt,
+    });
+    this.lifeforms.set(next.id, next);
+    this.appendIntentEvent(
+      lifeform.intentId,
+      input.audit,
+      input.decision === 'ACCEPTED'
+        ? 'forge.lifeform.proposal_accepted'
+        : 'forge.lifeform.proposal_rejected',
+      {
+        lifeformId: next.id,
+        proposalId: decided.id,
+        decision: input.decision,
+      },
+    );
+    return next;
+  }
+
+  async setLifeformStatus(input: {
+    lifeformId: string;
+    status: ForgeLifeformStatus;
+    audit: ForgeAudit;
+  }): Promise<ForgeLifeform> {
+    const lifeform = this.lifeforms.get(input.lifeformId);
+    if (!lifeform || lifeform.tenantId !== input.audit.tenantId) {
+      throw new ForgeLoopError('LIFEFORM_NOT_FOUND');
+    }
+    if (lifeform.status === 'TERMINATED') throw new ForgeLoopError('LIFEFORM_TERMINATED');
+    if (input.status === lifeform.status) return lifeform;
+    if (input.status === 'ACTIVE' && lifeform.status !== 'FROZEN') {
+      throw new ForgeLoopError('LIFEFORM_STATUS_INVALID');
+    }
+    if (input.status === 'FROZEN' && lifeform.status !== 'ACTIVE') {
+      throw new ForgeLoopError('LIFEFORM_STATUS_INVALID');
+    }
+    const next = freezeLifeform({
+      ...lifeform,
+      status: input.status,
+      updatedAt: input.audit.occurredAt,
+    });
+    this.lifeforms.set(next.id, next);
+    const type = input.status === 'FROZEN'
+      ? 'forge.lifeform.frozen'
+      : input.status === 'ACTIVE'
+        ? 'forge.lifeform.unfrozen'
+        : 'forge.lifeform.terminated';
+    this.appendIntentEvent(lifeform.intentId, input.audit, type, {
+      lifeformId: next.id,
+      status: next.status,
+    });
+    return next;
   }
 }
 

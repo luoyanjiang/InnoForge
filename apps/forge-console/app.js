@@ -33,6 +33,8 @@ const state = {
   allocationsByIntent: {},
   snapshots: [],
   snapshotIntentId: localStorage.getItem('forge.snapshotIntent') || null,
+  lifeforms: [],
+  selectedLifeformId: localStorage.getItem('forge.lifeform') || null,
   lumenLog: [],
   marketOwned: JSON.parse(localStorage.getItem('forge.market') || 'false'),
   connFilter: 'all',
@@ -617,24 +619,67 @@ function renderCollab() {
   });
 }
 
+function lifeformStatusLabel(status) {
+  if (status === 'FROZEN') return tt('lifeformFrozen');
+  if (status === 'TERMINATED') return tt('lifeformTerminated');
+  return tt('lifeformActive');
+}
+
+function proposalStatusLabel(status) {
+  if (status === 'ACCEPTED') return tt('lifeformAccepted');
+  if (status === 'REJECTED') return tt('lifeformRejected');
+  return tt('lifeformPending');
+}
+
+async function refreshLifeforms() {
+  try {
+    const data = await api('GET', '/v1/forge/lifeforms');
+    state.lifeforms = data.lifeforms || [];
+    if (state.selectedLifeformId && !state.lifeforms.some((l) => l.id === state.selectedLifeformId)) {
+      state.selectedLifeformId = state.lifeforms[0]?.id || null;
+      if (state.selectedLifeformId) localStorage.setItem('forge.lifeform', state.selectedLifeformId);
+      else localStorage.removeItem('forge.lifeform');
+    }
+  } catch {
+    state.lifeforms = [];
+  }
+}
+
 function renderDiscover() {
   setHeader(tt('navDiscover'), tt('discoverTitle'), tt('discoverSub'));
   const catalog = [
     { kind: 'project', titleZh: 'UrbanTwin 出行基础设施', titleEn: 'UrbanTwin mobility infrastructure', stake: 75 },
-    { kind: 'lifeform', titleZh: 'Struct-01 生命体', titleEn: 'Struct-01 lifeform', stake: 120 },
     { kind: 'project', titleZh: 'GridTwin 可再生调度', titleEn: 'GridTwin renewable dispatch', stake: 90 },
   ];
-  el('content').innerHTML = `<div class="panel">${catalog.map((item, idx) => `
-    <div class="list-row">
-      <div>
-        <div>${state.locale === 'zh' ? item.titleZh : item.titleEn}</div>
-        <div class="stat-sub">${item.kind === 'lifeform' ? tt('lifeform') : tt('project')}</div>
-      </div>
-      <div style="text-align:right">
-        <div style="color:var(--cyan)">${item.stake} Credit</div>
-        <button type="button" class="btn btn-cyan" data-stake="${idx}" style="margin-top:0.35rem">${tt('stakeJoin')}</button>
-      </div>
-    </div>`).join('')}</div>`;
+  const lifeforms = state.lifeforms || [];
+  el('content').innerHTML = `
+    <div class="panel">
+      <h3>${tt('projects')}</h3>
+      ${catalog.map((item, idx) => `
+      <div class="list-row">
+        <div>
+          <div>${state.locale === 'zh' ? item.titleZh : item.titleEn}</div>
+          <div class="stat-sub">${tt('project')}</div>
+        </div>
+        <div style="text-align:right">
+          <div style="color:var(--cyan)">${item.stake} Credit</div>
+          <button type="button" class="btn btn-cyan" data-stake="${idx}" style="margin-top:0.35rem">${tt('stakeJoin')}</button>
+        </div>
+      </div>`).join('')}
+    </div>
+    <div class="panel" style="margin-top:0.85rem">
+      <h3>${tt('lifeformCatalog')}</h3>
+      ${lifeforms.length ? lifeforms.map((lf) => `
+        <div class="list-row">
+          <div>
+            <div>${escapeAttr(lf.name)}</div>
+            <div class="stat-sub">${tt('lifeform')} · ${lifeformStatusLabel(lf.status)} · <span class="mono">${escapeAttr(lf.intentId)}</span></div>
+          </div>
+          <div style="text-align:right">
+            <button type="button" class="btn btn-ghost" data-open-life="${escapeAttr(lf.id)}">${tt('lifeformPanel')}</button>
+          </div>
+        </div>`).join('') : `<p class="empty">${tt('lifeformCatalogEmpty')}</p>`}
+    </div>`;
   el('content').querySelectorAll('[data-stake]').forEach((btn) => btn.addEventListener('click', async () => {
     const item = catalog[Number(btn.dataset.stake)];
     try {
@@ -655,6 +700,11 @@ function renderDiscover() {
     } catch (error) {
       toast(error.message);
     }
+  }));
+  el('content').querySelectorAll('[data-open-life]').forEach((btn) => btn.addEventListener('click', () => {
+    state.selectedLifeformId = btn.dataset.openLife;
+    localStorage.setItem('forge.lifeform', state.selectedLifeformId);
+    navigate('deploy');
   }));
 }
 
@@ -727,6 +777,169 @@ function pxnPathHtml(intent) {
   return rows.map(([k, v]) => `<div class="list-row"><span>${k}</span><span class="mono">${v}</span></div>`).join('');
 }
 
+function selectedLifeform() {
+  return state.lifeforms.find((item) => item.id === state.selectedLifeformId) || state.lifeforms[0] || null;
+}
+
+function lifeformPanelHtml() {
+  const settled = state.intents.filter((i) => i.status === 'SETTLED');
+  const lifeform = selectedLifeform();
+  const promotedIds = new Set(state.lifeforms.map((l) => l.intentId));
+  const eligible = settled.filter((i) => !promotedIds.has(i.id));
+  return `
+    <div class="panel" style="margin-top:0.85rem" id="lifeform-panel">
+      <h3>${tt('lifeformPanel')}</h3>
+      <p class="empty">${tt('lifeformHint')}</p>
+      <div class="field">
+        <span>${tt('lifeformCreate')}</span>
+        <select id="lifeform-intent">
+          ${eligible.length
+            ? eligible.map((i) => `<option value="${escapeAttr(i.id)}">${escapeAttr(i.statement.slice(0, 48))}</option>`).join('')
+            : `<option value="">${tt('lifeformNoSettled')}</option>`}
+        </select>
+      </div>
+      <div class="btn-row">
+        <button type="button" class="btn btn-primary" id="lifeform-create" ${eligible.length ? '' : 'disabled'}>${tt('lifeformCreate')}</button>
+        <button type="button" class="btn btn-ghost" id="lifeform-refresh">${tt('refresh')}</button>
+      </div>
+      ${state.lifeforms.length ? `
+        <label class="field" style="margin-top:0.75rem"><span>${tt('lifeform')}</span>
+          <select id="lifeform-pick">
+            ${state.lifeforms.map((l) => `
+              <option value="${escapeAttr(l.id)}" ${l.id === lifeform?.id ? 'selected' : ''}>
+                ${escapeAttr(l.name)} · ${lifeformStatusLabel(l.status)}
+              </option>`).join('')}
+          </select>
+        </label>` : `<p class="empty">${tt('lifeformEmpty')}</p>`}
+      ${lifeform ? `
+        <div class="list-row"><span>${tt('lifeformStatus')}</span><span>${lifeformStatusLabel(lifeform.status)}</span></div>
+        <div class="list-row"><span>Intent</span><span class="mono">${escapeAttr(lifeform.intentId)}</span></div>
+        <div class="btn-row">
+          <button type="button" class="btn btn-warn" id="lifeform-freeze" ${lifeform.status !== 'ACTIVE' ? 'disabled' : ''}>${tt('lifeformFreeze')}</button>
+          <button type="button" class="btn btn-cyan" id="lifeform-unfreeze" ${lifeform.status !== 'FROZEN' ? 'disabled' : ''}>${tt('lifeformUnfreeze')}</button>
+          <button type="button" class="btn btn-ghost" id="lifeform-terminate" ${lifeform.status === 'TERMINATED' ? 'disabled' : ''}>${tt('lifeformTerminate')}</button>
+        </div>
+        <h3 style="margin-top:0.85rem">${tt('lifeformProposal')}</h3>
+        <div class="field"><input id="lifeform-proposal-text" placeholder="${tt('lifeformProposalPh')}" ${lifeform.status !== 'ACTIVE' ? 'disabled' : ''}></div>
+        <button type="button" class="btn btn-primary" id="lifeform-proposal-add" ${lifeform.status !== 'ACTIVE' ? 'disabled' : ''}>${tt('lifeformProposalAdd')}</button>
+        <div id="lifeform-proposals" style="margin-top:0.65rem">
+          ${lifeform.proposals?.length ? lifeform.proposals.map((p) => `
+            <div class="list-row lifeform-proposal-row">
+              <div>
+                <div>${escapeAttr(p.summary)}</div>
+                <div class="stat-sub">${proposalStatusLabel(p.status)} · <span class="mono">${escapeAttr(p.id.slice(0, 18))}</span></div>
+              </div>
+              ${p.status === 'PENDING' && lifeform.status === 'ACTIVE' ? `
+                <div class="btn-row">
+                  <button type="button" class="btn btn-cyan" data-accept="${escapeAttr(p.id)}">${tt('lifeformProposalAccept')}</button>
+                  <button type="button" class="btn btn-warn" data-reject="${escapeAttr(p.id)}">${tt('lifeformProposalReject')}</button>
+                </div>` : ''}
+            </div>`).join('') : `<p class="empty">${tt('lifeformProposalEmpty')}</p>`}
+        </div>` : ''}
+    </div>`;
+}
+
+function bindLifeformPanel() {
+  el('lifeform-refresh')?.addEventListener('click', async () => {
+    await refreshLifeforms();
+    renderDeploy();
+  });
+  el('lifeform-pick')?.addEventListener('change', (event) => {
+    state.selectedLifeformId = event.target.value || null;
+    if (state.selectedLifeformId) localStorage.setItem('forge.lifeform', state.selectedLifeformId);
+    renderDeploy();
+  });
+  el('lifeform-create')?.addEventListener('click', async () => {
+    const intentId = el('lifeform-intent')?.value;
+    if (!intentId) return;
+    try {
+      const created = await api('POST', '/v1/forge/lifeforms', {
+        body: { intent_id: intentId },
+        idempotencyKey: `lifeform:${intentId}`,
+      });
+      state.selectedLifeformId = created.id;
+      localStorage.setItem('forge.lifeform', created.id);
+      await refreshLifeforms();
+      toast(tt('lifeformCreated'));
+      renderDeploy();
+    } catch (error) { toast(error.message); }
+  });
+  el('lifeform-freeze')?.addEventListener('click', async () => {
+    const lifeform = selectedLifeform();
+    if (!lifeform) return;
+    try {
+      await api('POST', `/v1/forge/lifeforms/${encodeURIComponent(lifeform.id)}/status`, {
+        body: { status: 'FROZEN' },
+        idempotencyKey: `life-freeze:${lifeform.id}:${Date.now()}`,
+      });
+      await refreshLifeforms();
+      renderDeploy();
+    } catch (error) { toast(error.message); }
+  });
+  el('lifeform-unfreeze')?.addEventListener('click', async () => {
+    const lifeform = selectedLifeform();
+    if (!lifeform) return;
+    try {
+      await api('POST', `/v1/forge/lifeforms/${encodeURIComponent(lifeform.id)}/status`, {
+        body: { status: 'ACTIVE' },
+        idempotencyKey: `life-unfreeze:${lifeform.id}:${Date.now()}`,
+      });
+      await refreshLifeforms();
+      renderDeploy();
+    } catch (error) { toast(error.message); }
+  });
+  el('lifeform-terminate')?.addEventListener('click', async () => {
+    const lifeform = selectedLifeform();
+    if (!lifeform) return;
+    if (!window.confirm(tt('lifeformTerminateConfirm'))) return;
+    try {
+      await api('POST', `/v1/forge/lifeforms/${encodeURIComponent(lifeform.id)}/status`, {
+        body: { status: 'TERMINATED' },
+        idempotencyKey: `life-term:${lifeform.id}:${Date.now()}`,
+      });
+      await refreshLifeforms();
+      renderDeploy();
+    } catch (error) { toast(error.message); }
+  });
+  el('lifeform-proposal-add')?.addEventListener('click', async () => {
+    const lifeform = selectedLifeform();
+    const summary = el('lifeform-proposal-text')?.value?.trim();
+    if (!lifeform || !summary) return;
+    try {
+      await api('POST', `/v1/forge/lifeforms/${encodeURIComponent(lifeform.id)}/proposals`, {
+        body: { summary },
+        idempotencyKey: `life-prop:${lifeform.id}:${Date.now()}`,
+      });
+      await refreshLifeforms();
+      renderDeploy();
+    } catch (error) { toast(error.message); }
+  });
+  el('content').querySelectorAll('[data-accept]').forEach((btn) => btn.addEventListener('click', async () => {
+    const lifeform = selectedLifeform();
+    if (!lifeform) return;
+    try {
+      await api('POST', `/v1/forge/lifeforms/${encodeURIComponent(lifeform.id)}/proposals/${encodeURIComponent(btn.dataset.accept)}/decide`, {
+        body: { decision: 'ACCEPTED' },
+        idempotencyKey: `life-acc:${btn.dataset.accept}`,
+      });
+      await refreshLifeforms();
+      renderDeploy();
+    } catch (error) { toast(error.message); }
+  }));
+  el('content').querySelectorAll('[data-reject]').forEach((btn) => btn.addEventListener('click', async () => {
+    const lifeform = selectedLifeform();
+    if (!lifeform) return;
+    try {
+      await api('POST', `/v1/forge/lifeforms/${encodeURIComponent(lifeform.id)}/proposals/${encodeURIComponent(btn.dataset.reject)}/decide`, {
+        body: { decision: 'REJECTED' },
+        idempotencyKey: `life-rej:${btn.dataset.reject}`,
+      });
+      await refreshLifeforms();
+      renderDeploy();
+    } catch (error) { toast(error.message); }
+  }));
+}
+
 function renderDeploy() {
   setHeader(tt('navDeploy'), tt('deployTitle'), tt('deploySub'));
   const intent = selectedIntent();
@@ -764,12 +977,14 @@ function renderDeploy() {
         <h3 style="margin-top:0.85rem">${tt('gatewayJobs')}</h3>
         ${intent?.deployJob ? `<pre class="mono" style="white-space:pre-wrap;margin:0;color:#c9d4e8">${JSON.stringify(intent.deployJob, null, 2)}</pre>` : `<p class="empty">${tt('emptyIntents')}</p>`}
       </div>
-    </div>`;
+    </div>
+    ${lifeformPanelHtml()}`;
   void mountR3f('lifeform', 'lifeform-3d');
   void refreshPartner().then(() => {
     const feed = document.getElementById('partner-feed');
     if (feed) feed.innerHTML = partnerEventsHtml();
   });
+  bindLifeformPanel();
   el('intent-pick')?.addEventListener('change', (e) => {
     state.selectedIntentId = e.target.value;
     localStorage.setItem('forge.intent', state.selectedIntentId);
@@ -1236,6 +1451,14 @@ function renderPage() {
   }
   if (state.page === 'governance') {
     void refreshSnapshots().then(() => renderGovernance());
+    return;
+  }
+  if (state.page === 'discover') {
+    void refreshLifeforms().then(() => renderDiscover());
+    return;
+  }
+  if (state.page === 'deploy') {
+    void refreshLifeforms().then(() => renderDeploy());
     return;
   }
   (map[state.page] || renderOverview)();
