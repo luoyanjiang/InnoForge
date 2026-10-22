@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_DB: innoforge
+      POSTGRES_PASSWORD: innoforge_dev_only
+      POSTGRES_USER: innoforge
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U innoforge -d innoforge"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - innoforge-postgres-data:/var/lib/postgresql/data
+
+volumes:
+  innoforge-postgres-data:

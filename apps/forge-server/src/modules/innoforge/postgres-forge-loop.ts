@@ -1,0 +1,721 @@
+import type { Pool } from 'pg';
+
+import type { ExternalJob } from '../../../../../packages/adapters/src/external-adapter.js';
+import { immutableJsonCopy } from '../../../../../packages/domain/src/canonical-json.js';
+import { ExternalAdapterRegistry } from './external-registry.js';
+import {
+  constraintsEqual,
+  legacyConstraintsFromStatement,
+  normalizeConstraints,
+  type ForgeConstraint,
+} from './forge-constraints.js';
+import {
+  findCandidate,
+  freezeJudgment,
+  judgmentIdFor,
+  listDefaultCandidates,
+  normalizeJudgmentAction,
+  type ForgeJudgment,
+  type ForgeJudgmentAction,
+  type ForgeVariantCandidate,
+} from './forge-judgments.js';
+import {
+  ForgeLoopError,
+  type CreditAccount,
+  type ForgeAudit,
+  type ForgeEvent,
+  type ForgeIntent,
+  type ForgeLoopService,
+  type ForgeLoopStatus,
+} from './forge-loop.js';
+import {
+  createPxnBridge,
+  type ForgePxnBridge,
+  type ForgePxnPath,
+} from './pxn-bridge.js';
+
+type JudgmentRow = {
+  id: string;
+  intent_id: string;
+  tenant_id: string;
+  actor_id: string;
+  candidate_id: string;
+  action: ForgeJudgmentAction;
+  rationale: string | null;
+  impact: string | null;
+  candidate_snapshot: ForgeVariantCandidate;
+  occurred_at: Date;
+};
+
+type IntentRow = {
+  id: string;
+  tenant_id: string;
+  principal_id: string;
+  statement: string;
+  constraints: ForgeConstraint[] | null;
+  frozen: boolean | null;
+  stake: string;
+  status: ForgeLoopStatus;
+  adapter_id: string;
+  pxn_task_id: string | null;
+  pxn_path: ForgePxnPath | null;
+  deploy_job_id: string | null;
+  deploy_job: ExternalJob | null;
+  credit_minted: string | null;
+  created_at: Date;
+  updated_at: Date;
+  confirmed_at: Date | null;
+  settled_at: Date | null;
+};
+
+type EventRow = {
+  id: string;
+  event_type: string;
+  occurred_at: Date;
+  actor_id: string;
+  payload: Record<string, unknown>;
+};
+
+/**
+ * PostgreSQL-backed forge loop. Adapter job state remains in the in-process
+ * ExternalAdapterRegistry (simulator); durable intent/credit state is in DB.
+ * PXN robot path uses createPxnBridge() (Sim by default; Http when PXN_BASE_URL set).
+ */
+export class PostgresForgeLoopService implements ForgeLoopService {
+  private readonly bridge: ForgePxnBridge;
+
+  constructor(
+    private readonly pool: Pool,
+    private readonly registry = new ExternalAdapterRegistry(),
+    bridge?: ForgePxnBridge,
+  ) {
+    this.bridge = bridge ?? createPxnBridge();
+  }
+
+  async ensureAccount(input: {
+    tenantId: string;
+    principalId: string;
+    openingBalance?: number;
+  }): Promise<CreditAccount> {
+    await this.pool.query(
+      `INSERT INTO forge_credit_accounts (tenant_id, principal_id, balance, staked, updated_at)
+       VALUES ($1,$2,$3,0,now())
+       ON CONFLICT (tenant_id, principal_id) DO NOTHING`,
+      [input.tenantId, input.principalId, input.openingBalance ?? 1000],
+    );
+    const account = await this.getAccount(input);
+    if (!account) throw new ForgeLoopError('ACCOUNT_NOT_FOUND');
+    return account;
+  }
+
+  async getAccount(input: { tenantId: string; principalId: string }): Promise<CreditAccount | undefined> {
+    const result = await this.pool.query<{ balance: string; staked: string }>(
+      `SELECT balance::text, staked::text FROM forge_credit_accounts
+        WHERE tenant_id=$1 AND principal_id=$2`,
+      [input.tenantId, input.principalId],
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    return Object.freeze({
+      tenantId: input.tenantId,
+      principalId: input.principalId,
+      balance: Number(row.balance),
+      staked: Number(row.staked),
+    });
+  }
+
+  async topUp(input: {
+    tenantId: string;
+    principalId: string;
+    amount: number;
+    audit: ForgeAudit;
+  }): Promise<CreditAccount> {
+    if (!(input.amount > 0) || !Number.isFinite(input.amount)) throw new ForgeLoopError('TOPUP_INVALID');
+    if (input.audit.tenantId !== input.tenantId) throw new ForgeLoopError('TENANT_SCOPE_MISMATCH');
+    await this.ensureAccount({ tenantId: input.tenantId, principalId: input.principalId });
+    await this.pool.query(
+      `UPDATE forge_credit_accounts
+          SET balance = balance + $3, updated_at = $4::timestamptz
+        WHERE tenant_id=$1 AND principal_id=$2`,
+      [input.tenantId, input.principalId, input.amount, input.audit.occurredAt],
+    );
+    const account = await this.getAccount({ tenantId: input.tenantId, principalId: input.principalId });
+    if (!account) throw new ForgeLoopError('ACCOUNT_NOT_FOUND');
+    return account;
+  }
+
+  async createIntent(input: {
+    id: string;
+    statement: string;
+    stake: number;
+    constraints?: readonly ForgeConstraint[] | unknown;
+    adapterId?: string;
+    pxnTaskId?: string;
+    audit: ForgeAudit;
+  }): Promise<ForgeIntent> {
+    if (!(input.stake > 0) || !Number.isFinite(input.stake)) throw new ForgeLoopError('STAKE_INVALID');
+    if (!input.statement.trim()) throw new ForgeLoopError('STATEMENT_REQUIRED');
+    const constraints = normalizeConstraints(input.constraints);
+    const existing = await this.get({ id: input.id, tenantId: input.audit.tenantId });
+    if (existing) {
+      if (
+        existing.statement !== input.statement.trim()
+        || existing.stake !== input.stake
+        || !constraintsEqual(existing.constraints, constraints)
+      ) {
+        throw new ForgeLoopError('INTENT_REPLACEMENT_DENIED');
+      }
+      return existing;
+    }
+    const adapterId = input.adapterId ?? 'mfg-fab';
+    if (!this.registry.get(adapterId)) throw new ForgeLoopError('ADAPTER_NOT_FOUND');
+    const pxnPath = await this.bridge.attachOnCreate({
+      intentId: input.id,
+      statement: input.statement.trim(),
+      stake: input.stake,
+      adapterId,
+      ...(input.pxnTaskId ? { existingTaskId: input.pxnTaskId } : {}),
+      audit: input.audit,
+    });
+    await this.ensureAccount({ tenantId: input.audit.tenantId, principalId: input.audit.actorId });
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const locked = await client.query<{ balance: string; staked: string }>(
+        `SELECT balance::text, staked::text FROM forge_credit_accounts
+          WHERE tenant_id=$1 AND principal_id=$2 FOR UPDATE`,
+        [input.audit.tenantId, input.audit.actorId],
+      );
+      const balance = Number(locked.rows[0]?.balance ?? 0);
+      if (balance < input.stake) throw new ForgeLoopError('INSUFFICIENT_CREDIT');
+      await client.query(
+        `UPDATE forge_credit_accounts
+            SET balance = balance - $3, staked = staked + $3, updated_at = $4::timestamptz
+          WHERE tenant_id=$1 AND principal_id=$2`,
+        [input.audit.tenantId, input.audit.actorId, input.stake, input.audit.occurredAt],
+      );
+      await client.query(
+        `INSERT INTO forge_intents
+          (id, tenant_id, principal_id, statement, constraints, frozen, stake, status, adapter_id,
+           pxn_task_id, pxn_path, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5::jsonb,false,$6,'STAKED',$7,$8,$9::jsonb,$10::timestamptz,$10::timestamptz)`,
+        [
+          input.id,
+          input.audit.tenantId,
+          input.audit.actorId,
+          input.statement.trim(),
+          JSON.stringify(constraints),
+          input.stake,
+          adapterId,
+          pxnPath.taskId,
+          JSON.stringify(pxnPath),
+          input.audit.occurredAt,
+        ],
+      );
+      const payload = {
+        stake: input.stake,
+        adapterId,
+        balanceAfter: balance - input.stake,
+        pxnTaskId: pxnPath.taskId,
+        pxnTaskState: pxnPath.taskState ?? null,
+        constraints,
+      };
+      await this.insertEvent(client, input.id, 'forge.intent.staked', input.audit, payload);
+      await this.appendDomainEvent(client, input.id, 'forge.intent.staked', input.audit, payload);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    const created = await this.get({ id: input.id, tenantId: input.audit.tenantId });
+    if (!created) throw new ForgeLoopError('INTENT_NOT_FOUND');
+    return created;
+  }
+
+  async updateIntent(input: {
+    id: string;
+    statement?: string;
+    constraints?: readonly ForgeConstraint[] | unknown;
+    frozen?: boolean;
+    audit: ForgeAudit;
+  }): Promise<ForgeIntent> {
+    const current = await this.requireIntent(input.id, input.audit.tenantId);
+    if (current.status !== 'STAKED' && current.status !== 'CONFIRMED') {
+      throw new ForgeLoopError('INTENT_NOT_EDITABLE');
+    }
+    const nextFrozen = input.frozen !== undefined ? Boolean(input.frozen) : current.frozen;
+    const wantsContent = input.statement !== undefined || input.constraints !== undefined;
+    if (wantsContent && current.frozen && input.frozen !== false) {
+      throw new ForgeLoopError('INTENT_FROZEN');
+    }
+    const nextStatement = input.statement !== undefined
+      ? input.statement.trim()
+      : current.statement;
+    if (!nextStatement) throw new ForgeLoopError('STATEMENT_REQUIRED');
+    const nextConstraints = input.constraints !== undefined
+      ? normalizeConstraints(input.constraints)
+      : current.constraints;
+    const contentChanged =
+      nextStatement !== current.statement
+      || !constraintsEqual(nextConstraints, current.constraints);
+    const freezeChanged = nextFrozen !== current.frozen;
+    if (!contentChanged && !freezeChanged) return current;
+
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE forge_intents
+            SET statement=$2, constraints=$3::jsonb, frozen=$4, updated_at=$5::timestamptz
+          WHERE id=$1 AND tenant_id=$6`,
+        [
+          input.id,
+          nextStatement,
+          JSON.stringify(nextConstraints),
+          nextFrozen,
+          input.audit.occurredAt,
+          input.audit.tenantId,
+        ],
+      );
+      if (contentChanged) {
+        const payload = { statement: nextStatement, constraints: nextConstraints };
+        await this.insertEvent(client, input.id, 'forge.intent.updated', input.audit, payload);
+        await this.appendDomainEvent(client, input.id, 'forge.intent.updated', input.audit, payload);
+      }
+      if (freezeChanged) {
+        const type = nextFrozen ? 'forge.intent.frozen' : 'forge.intent.unfrozen';
+        const payload = { frozen: nextFrozen };
+        await this.insertEvent(client, input.id, type, input.audit, payload);
+        await this.appendDomainEvent(client, input.id, type, input.audit, payload);
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    return this.requireIntent(input.id, input.audit.tenantId);
+  }
+
+  async confirm(input: { id: string; audit: ForgeAudit }): Promise<ForgeIntent> {
+    const current = await this.requireIntent(input.id, input.audit.tenantId);
+    if (current.status === 'CONFIRMED' || current.status === 'DEPLOYING'
+      || current.status === 'FEEDBACK' || current.status === 'SETTLED') {
+      return current;
+    }
+    if (current.status !== 'STAKED') throw new ForgeLoopError('INTENT_NOT_CONFIRMABLE');
+    const basePath = current.pxnPath ?? (current.pxnTaskId
+      ? Object.freeze({ taskId: current.pxnTaskId, mode: 'bridged' as const })
+      : undefined);
+    if (!basePath) throw new ForgeLoopError('PXN_PATH_REQUIRED');
+    const pxnPath = await this.bridge.confirmViaApprovals({
+      intentId: current.id,
+      path: basePath,
+      audit: input.audit,
+    });
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE forge_intents
+            SET status='CONFIRMED', confirmed_at=$2::timestamptz, updated_at=$2::timestamptz,
+                pxn_task_id=$3, pxn_path=$4::jsonb
+          WHERE id=$1 AND status='STAKED'`,
+        [input.id, input.audit.occurredAt, pxnPath.taskId, JSON.stringify(pxnPath)],
+      );
+      const payload = {
+        previousStatus: current.status,
+        pxnTaskId: pxnPath.taskId,
+        approvalId: pxnPath.approvalId ?? null,
+        pxnTaskState: pxnPath.taskState ?? null,
+      };
+      await this.insertEvent(client, input.id, 'forge.intent.confirmed', input.audit, payload);
+      await this.appendDomainEvent(client, input.id, 'forge.intent.confirmed', input.audit, payload);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    return this.requireIntent(input.id, input.audit.tenantId);
+  }
+
+  async deploy(input: { id: string; audit: ForgeAudit }): Promise<ForgeIntent> {
+    const current = await this.requireIntent(input.id, input.audit.tenantId);
+    if (current.status === 'DEPLOYING' || current.status === 'FEEDBACK' || current.status === 'SETTLED') {
+      return current;
+    }
+    if (current.status !== 'CONFIRMED') throw new ForgeLoopError('CONFIRMATION_REQUIRED');
+    const adapter = this.registry.get(current.adapterId);
+    if (!adapter) throw new ForgeLoopError('ADAPTER_NOT_FOUND');
+    const jobId = current.deployJobId ?? `job:${current.id}`;
+    const job = await adapter.createJob({
+      jobId,
+      at: input.audit.occurredAt,
+      payload: {
+        intentId: current.id,
+        statement: current.statement,
+        stake: current.stake,
+        pxnTaskId: current.pxnTaskId ?? null,
+        gateway: 'pxn.innoforge.deploy',
+      },
+    });
+    const basePath = current.pxnPath ?? (current.pxnTaskId
+      ? Object.freeze({ taskId: current.pxnTaskId, mode: 'bridged' as const })
+      : undefined);
+    if (!basePath) throw new ForgeLoopError('PXN_PATH_REQUIRED');
+    const pxnPath = await this.bridge.recordDeployPath({
+      intentId: current.id,
+      path: basePath,
+      deployJobId: job.jobId,
+      adapterId: adapter.adapterId,
+      audit: input.audit,
+    });
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE forge_intents
+            SET status='DEPLOYING', deploy_job_id=$2, deploy_job=$3::jsonb, updated_at=$4::timestamptz,
+                pxn_path=$5::jsonb
+          WHERE id=$1 AND status='CONFIRMED'`,
+        [input.id, job.jobId, JSON.stringify(job), input.audit.occurredAt, JSON.stringify(pxnPath)],
+      );
+      const payload = {
+        jobId: job.jobId,
+        adapterId: adapter.adapterId,
+        pxnDispatchId: pxnPath.dispatchId ?? null,
+        pxnEvidencePackageId: pxnPath.evidencePackageId ?? null,
+        pxnTaskState: pxnPath.taskState ?? null,
+      };
+      await this.insertEvent(client, input.id, 'forge.deploy.started', input.audit, payload);
+      await this.appendDomainEvent(client, input.id, 'forge.deploy.started', input.audit, payload);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    return this.requireIntent(input.id, input.audit.tenantId);
+  }
+
+  async feedback(input: { id: string; audit: ForgeAudit }): Promise<ForgeIntent> {
+    const current = await this.requireIntent(input.id, input.audit.tenantId);
+    if (current.status === 'SETTLED') return current;
+    if (current.status !== 'DEPLOYING' && current.status !== 'FEEDBACK') {
+      throw new ForgeLoopError('DEPLOY_REQUIRED');
+    }
+    const adapter = this.registry.get(current.adapterId);
+    if (!adapter || !current.deployJobId) throw new ForgeLoopError('DEPLOY_JOB_MISSING');
+    const job = adapter.tick
+      ? await adapter.tick(current.deployJobId, input.audit.occurredAt)
+      : await adapter.getJob(current.deployJobId);
+    if (!job) throw new ForgeLoopError('DEPLOY_JOB_MISSING');
+
+    const basePath = current.pxnPath ?? (current.pxnTaskId
+      ? Object.freeze({ taskId: current.pxnTaskId, mode: 'bridged' as const })
+      : undefined);
+    if (!basePath) throw new ForgeLoopError('PXN_PATH_REQUIRED');
+    const willSettle = job.status === 'SUCCEEDED';
+    const pxnPath = await this.bridge.recordFeedbackPath({
+      intentId: current.id,
+      path: basePath,
+      jobStatus: job.status,
+      settled: willSettle,
+      audit: input.audit,
+    });
+
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await this.insertEvent(client, input.id, 'forge.feedback.tick', input.audit, {
+        jobId: job.jobId,
+        status: job.status,
+        pxnTaskState: pxnPath.taskState ?? null,
+        ...(job.result ? { result: job.result } : {}),
+      });
+      if (!willSettle) {
+        await client.query(
+          `UPDATE forge_intents
+              SET status='FEEDBACK', deploy_job=$2::jsonb, updated_at=$3::timestamptz, pxn_path=$4::jsonb
+            WHERE id=$1`,
+          [input.id, JSON.stringify(job), input.audit.occurredAt, JSON.stringify(pxnPath)],
+        );
+        await client.query('COMMIT');
+        return this.requireIntent(input.id, input.audit.tenantId);
+      }
+      const minted = Math.round(current.stake * 1.5);
+      await client.query(
+        `UPDATE forge_credit_accounts
+            SET staked = staked - $3, balance = balance + $4, updated_at = $5::timestamptz
+          WHERE tenant_id=$1 AND principal_id=$2`,
+        [current.tenantId, current.principalId, current.stake, minted, input.audit.occurredAt],
+      );
+      await client.query(
+        `UPDATE forge_intents
+            SET status='SETTLED', deploy_job=$2::jsonb, credit_minted=$3,
+                settled_at=$4::timestamptz, updated_at=$4::timestamptz, pxn_path=$5::jsonb
+          WHERE id=$1`,
+        [input.id, JSON.stringify(job), minted, input.audit.occurredAt, JSON.stringify(pxnPath)],
+      );
+      const settlePayload = {
+        minted,
+        stakeReturnedAs: current.stake,
+        reward: minted - current.stake,
+        pxnAcceptanceId: pxnPath.acceptanceId ?? null,
+        pxnTaskState: pxnPath.taskState ?? null,
+      };
+      await this.insertEvent(client, input.id, 'forge.credit.settled', input.audit, settlePayload);
+      await this.appendDomainEvent(client, input.id, 'forge.credit.settled', input.audit, settlePayload);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    return this.requireIntent(input.id, input.audit.tenantId);
+  }
+
+  async get(input: { id: string; tenantId: string }): Promise<ForgeIntent | undefined> {
+    const result = await this.pool.query<IntentRow>(
+      `SELECT * FROM forge_intents WHERE id=$1 AND tenant_id=$2`,
+      [input.id, input.tenantId],
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    const events = await this.pool.query<EventRow>(
+      `SELECT id, event_type, occurred_at, actor_id, payload
+         FROM forge_intent_events WHERE intent_id=$1 ORDER BY occurred_at, id`,
+      [input.id],
+    );
+    return this.toView(row, events.rows);
+  }
+
+  async listIntents(input: { tenantId: string }): Promise<readonly ForgeIntent[]> {
+    const result = await this.pool.query<IntentRow>(
+      `SELECT * FROM forge_intents WHERE tenant_id=$1 ORDER BY updated_at DESC, id`,
+      [input.tenantId],
+    );
+    const intents: ForgeIntent[] = [];
+    for (const row of result.rows) {
+      const events = await this.pool.query<EventRow>(
+        `SELECT id, event_type, occurred_at, actor_id, payload
+           FROM forge_intent_events WHERE intent_id=$1 ORDER BY occurred_at, id`,
+        [row.id],
+      );
+      intents.push(this.toView(row, events.rows));
+    }
+    return intents;
+  }
+
+  async listAdapters(): Promise<readonly { adapterId: string; category: string; mode: string; healthy: boolean }[]> {
+    const health = await this.registry.healthAll();
+    return health.map(item => Object.freeze({
+      adapterId: item.adapterId,
+      category: item.category,
+      mode: item.mode,
+      healthy: item.healthy,
+    }));
+  }
+
+  async listVariantCandidates(): Promise<readonly ForgeVariantCandidate[]> {
+    return listDefaultCandidates();
+  }
+
+  async listJudgments(input: { intentId: string; tenantId: string }): Promise<readonly ForgeJudgment[]> {
+    await this.requireIntent(input.intentId, input.tenantId);
+    const result = await this.pool.query<JudgmentRow>(
+      `SELECT * FROM forge_judgments
+        WHERE intent_id=$1 AND tenant_id=$2
+        ORDER BY occurred_at DESC, id`,
+      [input.intentId, input.tenantId],
+    );
+    return result.rows.map((row) => this.judgmentToView(row));
+  }
+
+  async recordJudgment(input: {
+    intentId: string;
+    candidateId: string;
+    action: string;
+    rationale?: string;
+    impact?: string;
+    audit: ForgeAudit;
+  }): Promise<ForgeJudgment> {
+    await this.requireIntent(input.intentId, input.audit.tenantId);
+    const action = normalizeJudgmentAction(input.action);
+    const candidate = findCandidate(input.candidateId);
+    const id = judgmentIdFor(input.intentId, input.candidateId);
+    const existing = await this.pool.query<JudgmentRow>(
+      `SELECT * FROM forge_judgments WHERE id=$1`,
+      [id],
+    );
+    if (existing.rows[0]) {
+      const view = this.judgmentToView(existing.rows[0]);
+      if (view.action !== action) throw new ForgeLoopError('JUDGMENT_ALREADY_RECORDED');
+      return view;
+    }
+
+    const rationale = input.rationale?.trim() || null;
+    const impact = input.impact?.trim() || candidate.impact;
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `INSERT INTO forge_judgments
+          (id, intent_id, tenant_id, actor_id, candidate_id, action, rationale, impact,
+           candidate_snapshot, occurred_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10::timestamptz)`,
+        [
+          id,
+          input.intentId,
+          input.audit.tenantId,
+          input.audit.actorId,
+          candidate.id,
+          action,
+          rationale,
+          impact,
+          JSON.stringify(candidate),
+          input.audit.occurredAt,
+        ],
+      );
+      await client.query(
+        `UPDATE forge_intents SET updated_at=$2::timestamptz WHERE id=$1`,
+        [input.intentId, input.audit.occurredAt],
+      );
+      const payload = {
+        judgmentId: id,
+        candidateId: candidate.id,
+        action,
+        actorId: input.audit.actorId,
+        impact,
+        ...(rationale ? { rationale } : {}),
+      };
+      await this.insertEvent(client, input.intentId, 'forge.judgment.recorded', input.audit, payload);
+      await this.appendDomainEvent(client, input.intentId, 'forge.judgment.recorded', input.audit, payload);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    const created = await this.pool.query<JudgmentRow>(`SELECT * FROM forge_judgments WHERE id=$1`, [id]);
+    if (!created.rows[0]) throw new ForgeLoopError('JUDGMENT_NOT_FOUND');
+    return this.judgmentToView(created.rows[0]);
+  }
+
+  private judgmentToView(row: JudgmentRow): ForgeJudgment {
+    return freezeJudgment({
+      id: row.id,
+      intentId: row.intent_id,
+      tenantId: row.tenant_id,
+      actorId: row.actor_id,
+      candidateId: row.candidate_id,
+      action: row.action,
+      ...(row.rationale ? { rationale: row.rationale } : {}),
+      ...(row.impact ? { impact: row.impact } : {}),
+      candidateSnapshot: immutableJsonCopy(row.candidate_snapshot),
+      occurredAt: new Date(row.occurred_at).toISOString(),
+    });
+  }
+
+  private async requireIntent(id: string, tenantId: string): Promise<ForgeIntent> {
+    const intent = await this.get({ id, tenantId });
+    if (!intent) throw new ForgeLoopError('INTENT_NOT_FOUND');
+    return intent;
+  }
+
+  private toView(row: IntentRow, events: EventRow[]): ForgeIntent {
+    const mappedEvents: ForgeEvent[] = events.map(item => Object.freeze({
+      id: item.id,
+      type: item.event_type,
+      at: new Date(item.occurred_at).toISOString(),
+      actorId: item.actor_id,
+      payload: immutableJsonCopy(item.payload ?? {}),
+    }));
+    let constraints: readonly ForgeConstraint[];
+    try {
+      constraints = normalizeConstraints(row.constraints ?? []);
+    } catch {
+      constraints = Object.freeze([]);
+    }
+    if (constraints.length === 0) {
+      constraints = legacyConstraintsFromStatement(row.statement);
+    }
+    return Object.freeze({
+      id: row.id,
+      tenantId: row.tenant_id,
+      principalId: row.principal_id,
+      statement: row.statement,
+      constraints,
+      frozen: Boolean(row.frozen),
+      stake: Number(row.stake),
+      status: row.status,
+      adapterId: row.adapter_id,
+      ...(row.pxn_task_id ? { pxnTaskId: row.pxn_task_id } : {}),
+      ...(row.pxn_path ? { pxnPath: immutableJsonCopy(row.pxn_path) } : {}),
+      ...(row.deploy_job_id ? { deployJobId: row.deploy_job_id } : {}),
+      ...(row.deploy_job ? { deployJob: immutableJsonCopy(row.deploy_job) } : {}),
+      ...(row.credit_minted != null ? { creditMinted: Number(row.credit_minted) } : {}),
+      createdAt: new Date(row.created_at).toISOString(),
+      updatedAt: new Date(row.updated_at).toISOString(),
+      ...(row.confirmed_at ? { confirmedAt: new Date(row.confirmed_at).toISOString() } : {}),
+      ...(row.settled_at ? { settledAt: new Date(row.settled_at).toISOString() } : {}),
+      events: Object.freeze(mappedEvents),
+    });
+  }
+
+  private async insertEvent(
+    client: { query: Pool['query'] },
+    intentId: string,
+    type: string,
+    audit: ForgeAudit,
+    payload: Record<string, unknown>,
+  ): Promise<void> {
+    const id = `fev:${intentId}:${type}:${audit.idempotencyKey}`.slice(0, 200);
+    await client.query(
+      `INSERT INTO forge_intent_events
+        (id, intent_id, event_type, occurred_at, actor_id, payload)
+       VALUES ($1,$2,$3,$4::timestamptz,$5,$6::jsonb)
+       ON CONFLICT (id) DO NOTHING`,
+      [id, intentId, type, audit.occurredAt, audit.actorId, JSON.stringify(payload)],
+    );
+  }
+
+  private async appendDomainEvent(
+    client: { query: Pool['query'] },
+    intentId: string,
+    eventType: string,
+    audit: ForgeAudit,
+    payload: Record<string, unknown>,
+  ): Promise<void> {
+    const eventId = `event:forge:${intentId}:${eventType}:${audit.idempotencyKey}`.slice(0, 200);
+    const body = { intentId, actorId: audit.actorId, requestId: audit.requestId, ...payload };
+    await client.query(
+      `INSERT INTO domain_events
+        (id, aggregate_type, aggregate_id, event_type, occurred_at, payload)
+       VALUES ($1,'forge_intent',$2,$3,$4::timestamptz,$5::jsonb)
+       ON CONFLICT (id) DO NOTHING`,
+      [eventId, intentId, eventType, audit.occurredAt, JSON.stringify(body)],
+    );
+    await client.query(
+      `INSERT INTO outbox_messages
+        (id, topic, partition_key, event_id, payload, status, created_at)
+       VALUES ($1,'pxn.forge-events',$2,$3,$4::jsonb,'PENDING',$5::timestamptz)
+       ON CONFLICT (id) DO NOTHING`,
+      [
+        `outbox:forge:${intentId}:${eventType}:${audit.idempotencyKey}`.slice(0, 200),
+        intentId,
+        eventId,
+        JSON.stringify({ eventId, ...body }),
+        audit.occurredAt,
+      ],
+    );
+  }
+}

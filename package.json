@@ -1,0 +1,29 @@
+{
+  "name": "innoforge",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "db:migrate": "tsx scripts/db-migrate.ts up",
+    "db:rollback": "tsx scripts/db-migrate.ts down",
+    "db:status": "tsx scripts/db-migrate.ts status",
+    "dev": "tsx watch apps/forge-server/src/server.ts",
+    "start": "tsx apps/forge-server/src/server.ts",
+    "innoforge:test": "tsx --test tests/innoforge/*.test.ts",
+    "local:ci": "bash scripts/local-ci.sh",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/pg": "8.23.1",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  },
+  "dependencies": {
+    "@fastify/swagger": "9.8.1",
+    "fastify": "5.12.1",
+    "pg": "8.23.0"
+  }
+}

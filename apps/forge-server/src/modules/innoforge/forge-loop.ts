@@ -1,0 +1,601 @@
+import { createHash, randomUUID } from 'node:crypto';
+
+import type { ExternalJob } from '../../../../../packages/adapters/src/external-adapter.js';
+import { immutableJsonCopy } from '../../../../../packages/domain/src/canonical-json.js';
+import {
+  constraintsEqual,
+  normalizeConstraints,
+  type ForgeConstraint,
+} from './forge-constraints.js';
+import {
+  findCandidate,
+  freezeJudgment,
+  judgmentIdFor,
+  listDefaultCandidates,
+  normalizeJudgmentAction,
+  type ForgeJudgment,
+  type ForgeVariantCandidate,
+} from './forge-judgments.js';
+import { ExternalAdapterRegistry } from './external-registry.js';
+import {
+  InMemoryForgePxnBridge,
+  type ForgePxnBridge,
+  type ForgePxnPath,
+} from './pxn-bridge.js';
+
+export type { ForgeConstraint } from './forge-constraints.js';
+export type { ForgeJudgment, ForgeJudgmentAction, ForgeVariantCandidate } from './forge-judgments.js';
+
+export type ForgeLoopStatus =
+  | 'DRAFT'
+  | 'STAKED'
+  | 'CONFIRMED'
+  | 'DEPLOYING'
+  | 'FEEDBACK'
+  | 'SETTLED'
+  | 'REJECTED';
+
+export type ForgeAudit = Readonly<{
+  actorId: string;
+  idempotencyKey: string;
+  requestId: string;
+  occurredAt: string;
+  tenantId: string;
+}>;
+
+export type ForgeIntent = Readonly<{
+  id: string;
+  tenantId: string;
+  principalId: string;
+  statement: string;
+  constraints: readonly ForgeConstraint[];
+  frozen: boolean;
+  stake: number;
+  status: ForgeLoopStatus;
+  adapterId: string;
+  pxnTaskId?: string;
+  pxnPath?: ForgePxnPath;
+  deployJobId?: string;
+  deployJob?: ExternalJob;
+  creditMinted?: number;
+  createdAt: string;
+  updatedAt: string;
+  confirmedAt?: string;
+  settledAt?: string;
+  events: readonly ForgeEvent[];
+}>;
+
+export type ForgeEvent = Readonly<{
+  id: string;
+  type: string;
+  at: string;
+  actorId: string;
+  payload: Readonly<Record<string, unknown>>;
+}>;
+
+export type CreditAccount = Readonly<{
+  tenantId: string;
+  principalId: string;
+  balance: number;
+  staked: number;
+}>;
+
+export interface ForgeLoopService {
+  ensureAccount(input: { tenantId: string; principalId: string; openingBalance?: number }): Promise<CreditAccount>;
+  getAccount(input: { tenantId: string; principalId: string }): Promise<CreditAccount | undefined>;
+  topUp(input: { tenantId: string; principalId: string; amount: number; audit: ForgeAudit }): Promise<CreditAccount>;
+  createIntent(input: {
+    id: string;
+    statement: string;
+    stake: number;
+    constraints?: readonly ForgeConstraint[] | unknown;
+    adapterId?: string;
+    pxnTaskId?: string;
+    audit: ForgeAudit;
+  }): Promise<ForgeIntent>;
+  updateIntent(input: {
+    id: string;
+    statement?: string;
+    constraints?: readonly ForgeConstraint[] | unknown;
+    frozen?: boolean;
+    audit: ForgeAudit;
+  }): Promise<ForgeIntent>;
+  confirm(input: { id: string; audit: ForgeAudit }): Promise<ForgeIntent>;
+  deploy(input: { id: string; audit: ForgeAudit }): Promise<ForgeIntent>;
+  feedback(input: { id: string; audit: ForgeAudit }): Promise<ForgeIntent>;
+  get(input: { id: string; tenantId: string }): Promise<ForgeIntent | undefined>;
+  listIntents(input: { tenantId: string }): Promise<readonly ForgeIntent[]>;
+  listAdapters(): Promise<readonly { adapterId: string; category: string; mode: string; healthy: boolean }[]>;
+  listVariantCandidates(): Promise<readonly ForgeVariantCandidate[]>;
+  listJudgments(input: { intentId: string; tenantId: string }): Promise<readonly ForgeJudgment[]>;
+  recordJudgment(input: {
+    intentId: string;
+    candidateId: string;
+    action: string;
+    rationale?: string;
+    impact?: string;
+    audit: ForgeAudit;
+  }): Promise<ForgeJudgment>;
+}
+
+export class ForgeLoopError extends Error {
+  constructor(readonly code: string) {
+    super(code);
+    this.name = 'ForgeLoopError';
+  }
+}
+
+type MutableAccount = { balance: number; staked: number };
+type MutableIntent = {
+  view: ForgeIntent;
+  events: ForgeEvent[];
+};
+
+function event(type: string, audit: ForgeAudit, payload: Record<string, unknown> = {}): ForgeEvent {
+  return Object.freeze({
+    id: `fev:${createHash('sha256').update(`${audit.idempotencyKey}:${type}`).digest('hex').slice(0, 24)}`,
+    type,
+    at: audit.occurredAt,
+    actorId: audit.actorId,
+    payload: Object.freeze(payload),
+  });
+}
+
+/** In-memory Intent OS × InnoForge closed loop on PXN control-plane conventions. */
+export class InMemoryForgeLoopService implements ForgeLoopService {
+  private readonly accounts = new Map<string, MutableAccount>();
+  private readonly intents = new Map<string, MutableIntent>();
+  private readonly judgments = new Map<string, ForgeJudgment>();
+  private readonly bridge: ForgePxnBridge;
+
+  constructor(
+    private readonly registry = new ExternalAdapterRegistry(),
+    bridge?: ForgePxnBridge,
+  ) {
+    this.bridge = bridge ?? new InMemoryForgePxnBridge();
+  }
+
+  private accountKey(tenantId: string, principalId: string): string {
+    return `${tenantId}::${principalId}`;
+  }
+
+  async ensureAccount(input: {
+    tenantId: string;
+    principalId: string;
+    openingBalance?: number;
+  }): Promise<CreditAccount> {
+    const key = this.accountKey(input.tenantId, input.principalId);
+    let account = this.accounts.get(key);
+    if (!account) {
+      account = { balance: input.openingBalance ?? 1000, staked: 0 };
+      this.accounts.set(key, account);
+    }
+    return Object.freeze({
+      tenantId: input.tenantId,
+      principalId: input.principalId,
+      balance: account.balance,
+      staked: account.staked,
+    });
+  }
+
+  async getAccount(input: { tenantId: string; principalId: string }): Promise<CreditAccount | undefined> {
+    const account = this.accounts.get(this.accountKey(input.tenantId, input.principalId));
+    if (!account) return undefined;
+    return Object.freeze({
+      tenantId: input.tenantId,
+      principalId: input.principalId,
+      balance: account.balance,
+      staked: account.staked,
+    });
+  }
+
+  async topUp(input: {
+    tenantId: string;
+    principalId: string;
+    amount: number;
+    audit: ForgeAudit;
+  }): Promise<CreditAccount> {
+    if (!(input.amount > 0) || !Number.isFinite(input.amount)) throw new ForgeLoopError('TOPUP_INVALID');
+    if (input.audit.tenantId !== input.tenantId) throw new ForgeLoopError('TENANT_SCOPE_MISMATCH');
+    await this.ensureAccount({ tenantId: input.tenantId, principalId: input.principalId });
+    const mutable = this.accounts.get(this.accountKey(input.tenantId, input.principalId))!;
+    mutable.balance += input.amount;
+    return Object.freeze({
+      tenantId: input.tenantId,
+      principalId: input.principalId,
+      balance: mutable.balance,
+      staked: mutable.staked,
+    });
+  }
+
+  async createIntent(input: {
+    id: string;
+    statement: string;
+    stake: number;
+    constraints?: readonly ForgeConstraint[] | unknown;
+    adapterId?: string;
+    pxnTaskId?: string;
+    audit: ForgeAudit;
+  }): Promise<ForgeIntent> {
+    if (input.audit.actorId !== input.audit.tenantId && !input.audit.actorId) {
+      throw new ForgeLoopError('ACTOR_REQUIRED');
+    }
+    if (!(input.stake > 0) || !Number.isFinite(input.stake)) throw new ForgeLoopError('STAKE_INVALID');
+    if (!input.statement.trim()) throw new ForgeLoopError('STATEMENT_REQUIRED');
+    const constraints = normalizeConstraints(input.constraints);
+    const existing = this.intents.get(input.id);
+    if (existing) {
+      if (existing.view.tenantId !== input.audit.tenantId) throw new ForgeLoopError('TENANT_SCOPE_MISMATCH');
+      if (
+        existing.view.statement !== input.statement.trim()
+        || existing.view.stake !== input.stake
+        || !constraintsEqual(existing.view.constraints, constraints)
+      ) {
+        throw new ForgeLoopError('INTENT_REPLACEMENT_DENIED');
+      }
+      return existing.view;
+    }
+    const adapterId = input.adapterId ?? 'mfg-fab';
+    if (!this.registry.get(adapterId)) throw new ForgeLoopError('ADAPTER_NOT_FOUND');
+    const account = await this.ensureAccount({
+      tenantId: input.audit.tenantId,
+      principalId: input.audit.actorId,
+    });
+    const mutable = this.accounts.get(this.accountKey(input.audit.tenantId, input.audit.actorId))!;
+    if (mutable.balance < input.stake) throw new ForgeLoopError('INSUFFICIENT_CREDIT');
+    mutable.balance -= input.stake;
+    mutable.staked += input.stake;
+    const pxnPath = await this.bridge.attachOnCreate({
+      intentId: input.id,
+      statement: input.statement.trim(),
+      stake: input.stake,
+      adapterId,
+      ...(input.pxnTaskId ? { existingTaskId: input.pxnTaskId } : {}),
+      audit: input.audit,
+    });
+    const ev = event('forge.intent.staked', input.audit, {
+      stake: input.stake,
+      adapterId,
+      balanceAfter: mutable.balance,
+      pxnTaskId: pxnPath.taskId,
+      pxnTaskState: pxnPath.taskState ?? null,
+      constraints,
+    });
+    const view: ForgeIntent = Object.freeze({
+      id: input.id,
+      tenantId: input.audit.tenantId,
+      principalId: input.audit.actorId,
+      statement: input.statement.trim(),
+      constraints,
+      frozen: false,
+      stake: input.stake,
+      status: 'STAKED',
+      adapterId,
+      pxnTaskId: pxnPath.taskId,
+      pxnPath,
+      createdAt: input.audit.occurredAt,
+      updatedAt: input.audit.occurredAt,
+      events: Object.freeze([ev]),
+    });
+    this.intents.set(input.id, { view, events: [ev] });
+    void account;
+    return view;
+  }
+
+  async updateIntent(input: {
+    id: string;
+    statement?: string;
+    constraints?: readonly ForgeConstraint[] | unknown;
+    frozen?: boolean;
+    audit: ForgeAudit;
+  }): Promise<ForgeIntent> {
+    const record = this.intents.get(input.id);
+    if (!record) throw new ForgeLoopError('INTENT_NOT_FOUND');
+    if (record.view.tenantId !== input.audit.tenantId) throw new ForgeLoopError('TENANT_SCOPE_MISMATCH');
+    if (record.view.status !== 'STAKED' && record.view.status !== 'CONFIRMED') {
+      throw new ForgeLoopError('INTENT_NOT_EDITABLE');
+    }
+
+    const nextFrozen = input.frozen !== undefined ? Boolean(input.frozen) : record.view.frozen;
+    const wantsContent =
+      input.statement !== undefined || input.constraints !== undefined;
+    if (wantsContent && record.view.frozen && input.frozen !== false) {
+      throw new ForgeLoopError('INTENT_FROZEN');
+    }
+
+    const nextStatement = input.statement !== undefined
+      ? input.statement.trim()
+      : record.view.statement;
+    if (!nextStatement) throw new ForgeLoopError('STATEMENT_REQUIRED');
+    const nextConstraints = input.constraints !== undefined
+      ? normalizeConstraints(input.constraints)
+      : record.view.constraints;
+
+    const contentChanged =
+      nextStatement !== record.view.statement
+      || !constraintsEqual(nextConstraints, record.view.constraints);
+    const freezeChanged = nextFrozen !== record.view.frozen;
+    if (!contentChanged && !freezeChanged) return record.view;
+
+    if (contentChanged) {
+      const ev = event('forge.intent.updated', input.audit, {
+        statement: nextStatement,
+        constraints: nextConstraints,
+      });
+      record.events.push(ev);
+    }
+    if (freezeChanged) {
+      const ev = event(
+        nextFrozen ? 'forge.intent.frozen' : 'forge.intent.unfrozen',
+        input.audit,
+        { frozen: nextFrozen },
+      );
+      record.events.push(ev);
+    }
+    record.view = Object.freeze({
+      ...record.view,
+      statement: nextStatement,
+      constraints: nextConstraints,
+      frozen: nextFrozen,
+      updatedAt: input.audit.occurredAt,
+      events: Object.freeze([...record.events]),
+    });
+    return record.view;
+  }
+
+  async confirm(input: { id: string; audit: ForgeAudit }): Promise<ForgeIntent> {
+    const record = this.intents.get(input.id);
+    if (!record) throw new ForgeLoopError('INTENT_NOT_FOUND');
+    if (record.view.tenantId !== input.audit.tenantId) throw new ForgeLoopError('TENANT_SCOPE_MISMATCH');
+    if (record.view.status === 'CONFIRMED' || record.view.status === 'DEPLOYING'
+      || record.view.status === 'FEEDBACK' || record.view.status === 'SETTLED') {
+      return record.view;
+    }
+    if (record.view.status !== 'STAKED') throw new ForgeLoopError('INTENT_NOT_CONFIRMABLE');
+    const basePath = record.view.pxnPath ?? (record.view.pxnTaskId
+      ? Object.freeze({ taskId: record.view.pxnTaskId, mode: 'bridged' as const })
+      : undefined);
+    if (!basePath) throw new ForgeLoopError('PXN_PATH_REQUIRED');
+    // Human sovereignty: confirmer may differ from requester (governance path).
+    const pxnPath = await this.bridge.confirmViaApprovals({
+      intentId: record.view.id,
+      path: basePath,
+      audit: input.audit,
+    });
+    const ev = event('forge.intent.confirmed', input.audit, {
+      previousStatus: record.view.status,
+      pxnTaskId: pxnPath.taskId,
+      approvalId: pxnPath.approvalId ?? null,
+      pxnTaskState: pxnPath.taskState ?? null,
+    });
+    record.events.push(ev);
+    record.view = Object.freeze({
+      ...record.view,
+      status: 'CONFIRMED',
+      pxnTaskId: pxnPath.taskId,
+      pxnPath,
+      updatedAt: input.audit.occurredAt,
+      confirmedAt: input.audit.occurredAt,
+      events: Object.freeze([...record.events]),
+    });
+    return record.view;
+  }
+
+  async deploy(input: { id: string; audit: ForgeAudit }): Promise<ForgeIntent> {
+    const record = this.intents.get(input.id);
+    if (!record) throw new ForgeLoopError('INTENT_NOT_FOUND');
+    if (record.view.tenantId !== input.audit.tenantId) throw new ForgeLoopError('TENANT_SCOPE_MISMATCH');
+    if (record.view.status === 'DEPLOYING' || record.view.status === 'FEEDBACK' || record.view.status === 'SETTLED') {
+      return record.view;
+    }
+    if (record.view.status !== 'CONFIRMED') throw new ForgeLoopError('CONFIRMATION_REQUIRED');
+    const adapter = this.registry.get(record.view.adapterId);
+    if (!adapter) throw new ForgeLoopError('ADAPTER_NOT_FOUND');
+    const jobId = record.view.deployJobId ?? `job:${record.view.id}`;
+    const job = await adapter.createJob({
+      jobId,
+      at: input.audit.occurredAt,
+      payload: {
+        intentId: record.view.id,
+        statement: record.view.statement,
+        stake: record.view.stake,
+        pxnTaskId: record.view.pxnTaskId ?? null,
+        gateway: 'pxn.innoforge.deploy',
+      },
+    });
+    const basePath = record.view.pxnPath ?? (record.view.pxnTaskId
+      ? Object.freeze({ taskId: record.view.pxnTaskId, mode: 'bridged' as const })
+      : undefined);
+    if (!basePath) throw new ForgeLoopError('PXN_PATH_REQUIRED');
+    const pxnPath = await this.bridge.recordDeployPath({
+      intentId: record.view.id,
+      path: basePath,
+      deployJobId: job.jobId,
+      adapterId: adapter.adapterId,
+      audit: input.audit,
+    });
+    const ev = event('forge.deploy.started', input.audit, {
+      jobId: job.jobId,
+      adapterId: adapter.adapterId,
+      pxnDispatchId: pxnPath.dispatchId ?? null,
+      pxnEvidencePackageId: pxnPath.evidencePackageId ?? null,
+      pxnTaskState: pxnPath.taskState ?? null,
+    });
+    record.events.push(ev);
+    record.view = Object.freeze({
+      ...record.view,
+      status: 'DEPLOYING',
+      deployJobId: job.jobId,
+      deployJob: job,
+      pxnPath,
+      updatedAt: input.audit.occurredAt,
+      events: Object.freeze([...record.events]),
+    });
+    return record.view;
+  }
+
+  async feedback(input: { id: string; audit: ForgeAudit }): Promise<ForgeIntent> {
+    const record = this.intents.get(input.id);
+    if (!record) throw new ForgeLoopError('INTENT_NOT_FOUND');
+    if (record.view.tenantId !== input.audit.tenantId) throw new ForgeLoopError('TENANT_SCOPE_MISMATCH');
+    if (record.view.status === 'SETTLED') return record.view;
+    if (record.view.status !== 'DEPLOYING' && record.view.status !== 'FEEDBACK') {
+      throw new ForgeLoopError('DEPLOY_REQUIRED');
+    }
+    const adapter = this.registry.get(record.view.adapterId);
+    if (!adapter || !record.view.deployJobId) throw new ForgeLoopError('DEPLOY_JOB_MISSING');
+    const job = adapter.tick
+      ? await adapter.tick(record.view.deployJobId, input.audit.occurredAt)
+      : await adapter.getJob(record.view.deployJobId);
+    if (!job) throw new ForgeLoopError('DEPLOY_JOB_MISSING');
+    const basePath = record.view.pxnPath ?? (record.view.pxnTaskId
+      ? Object.freeze({ taskId: record.view.pxnTaskId, mode: 'bridged' as const })
+      : undefined);
+    if (!basePath) throw new ForgeLoopError('PXN_PATH_REQUIRED');
+    const willSettle = job.status === 'SUCCEEDED';
+    const pxnPath = await this.bridge.recordFeedbackPath({
+      intentId: record.view.id,
+      path: basePath,
+      jobStatus: job.status,
+      settled: willSettle,
+      audit: input.audit,
+    });
+    const tickEvent = event('forge.feedback.tick', input.audit, {
+      jobId: job.jobId,
+      status: job.status,
+      pxnTaskState: pxnPath.taskState ?? null,
+      ...(job.result ? { result: job.result } : {}),
+    });
+    record.events.push(tickEvent);
+    if (!willSettle) {
+      record.view = Object.freeze({
+        ...record.view,
+        status: 'FEEDBACK',
+        deployJob: job,
+        pxnPath,
+        updatedAt: input.audit.occurredAt,
+        events: Object.freeze([...record.events]),
+      });
+      return record.view;
+    }
+    // Simulated value realization: return stake + 50% reward to confirmer path principal.
+    const minted = Math.round(record.view.stake * 1.5);
+    const mutable = this.accounts.get(this.accountKey(record.view.tenantId, record.view.principalId));
+    if (!mutable) throw new ForgeLoopError('ACCOUNT_NOT_FOUND');
+    mutable.staked -= record.view.stake;
+    mutable.balance += minted;
+    const settleEvent = event('forge.credit.settled', input.audit, {
+      minted,
+      stakeReturnedAs: record.view.stake,
+      reward: minted - record.view.stake,
+      balanceAfter: mutable.balance,
+      pxnAcceptanceId: pxnPath.acceptanceId ?? null,
+      pxnTaskState: pxnPath.taskState ?? null,
+    });
+    record.events.push(settleEvent);
+    record.view = Object.freeze({
+      ...record.view,
+      status: 'SETTLED',
+      deployJob: job,
+      creditMinted: minted,
+      pxnPath,
+      updatedAt: input.audit.occurredAt,
+      settledAt: input.audit.occurredAt,
+      events: Object.freeze([...record.events]),
+    });
+    return record.view;
+  }
+
+  async get(input: { id: string; tenantId: string }): Promise<ForgeIntent | undefined> {
+    const record = this.intents.get(input.id);
+    if (!record || record.view.tenantId !== input.tenantId) return undefined;
+    return record.view;
+  }
+
+  async listIntents(input: { tenantId: string }): Promise<readonly ForgeIntent[]> {
+    return [...this.intents.values()]
+      .filter(item => item.view.tenantId === input.tenantId)
+      .map(item => item.view)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  }
+
+  async listAdapters(): Promise<readonly { adapterId: string; category: string; mode: string; healthy: boolean }[]> {
+    const health = await this.registry.healthAll();
+    return health.map(item => Object.freeze({
+      adapterId: item.adapterId,
+      category: item.category,
+      mode: item.mode,
+      healthy: item.healthy,
+    }));
+  }
+
+  async listVariantCandidates(): Promise<readonly ForgeVariantCandidate[]> {
+    return listDefaultCandidates();
+  }
+
+  async listJudgments(input: { intentId: string; tenantId: string }): Promise<readonly ForgeJudgment[]> {
+    const intent = await this.get({ id: input.intentId, tenantId: input.tenantId });
+    if (!intent) throw new ForgeLoopError('INTENT_NOT_FOUND');
+    return [...this.judgments.values()]
+      .filter((item) => item.intentId === input.intentId && item.tenantId === input.tenantId)
+      .sort((left, right) => right.occurredAt.localeCompare(left.occurredAt));
+  }
+
+  async recordJudgment(input: {
+    intentId: string;
+    candidateId: string;
+    action: string;
+    rationale?: string;
+    impact?: string;
+    audit: ForgeAudit;
+  }): Promise<ForgeJudgment> {
+    const intent = await this.get({ id: input.intentId, tenantId: input.audit.tenantId });
+    if (!intent) throw new ForgeLoopError('INTENT_NOT_FOUND');
+    if (intent.tenantId !== input.audit.tenantId) throw new ForgeLoopError('TENANT_SCOPE_MISMATCH');
+    const action = normalizeJudgmentAction(input.action);
+    const candidate = findCandidate(input.candidateId);
+    const id = judgmentIdFor(input.intentId, input.candidateId);
+    const existing = this.judgments.get(id);
+    if (existing) {
+      if (existing.action !== action) throw new ForgeLoopError('JUDGMENT_ALREADY_RECORDED');
+      return existing;
+    }
+    const judgment = freezeJudgment({
+      id,
+      intentId: input.intentId,
+      tenantId: input.audit.tenantId,
+      actorId: input.audit.actorId,
+      candidateId: candidate.id,
+      action,
+      ...(input.rationale?.trim() ? { rationale: input.rationale.trim() } : {}),
+      ...(input.impact?.trim() ? { impact: input.impact.trim() } : { impact: candidate.impact }),
+      candidateSnapshot: candidate,
+      occurredAt: input.audit.occurredAt,
+    });
+    this.judgments.set(id, judgment);
+    const record = this.intents.get(input.intentId);
+    if (record) {
+      const ev = event('forge.judgment.recorded', input.audit, {
+        judgmentId: judgment.id,
+        candidateId: judgment.candidateId,
+        action: judgment.action,
+        actorId: judgment.actorId,
+      });
+      record.events.push(ev);
+      record.view = Object.freeze({
+        ...record.view,
+        updatedAt: input.audit.occurredAt,
+        events: Object.freeze([...record.events]),
+      });
+    }
+    return judgment;
+  }
+}
+
+export function newForgeIntentId(): string {
+  return `forge:${randomUUID()}`;
+}
+
+export function snapshotIntent(intent: ForgeIntent): ForgeIntent {
+  return immutableJsonCopy(intent);
+}
