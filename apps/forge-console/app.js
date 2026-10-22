@@ -1,46 +1,26 @@
 import { t } from './i18n.js';
+import { mountStudioWorkbench, WORKBENCH_INTENT_ID } from './workbench.js';
 
-/** Create-flow OS nav groups — not a flat toolbox. */
+/** Product shell: validation studio first; Intent OS loop as secondary “闭环”. */
 const NAV_GROUPS = [
   {
-    id: 'intent',
-    labelKey: 'navGroupIntent',
+    id: 'studio',
+    labelKey: 'navGroupStudio',
+    items: [['studio', 'navStudio']],
+  },
+  {
+    id: 'loop',
+    labelKey: 'navGroupLoop',
     items: [
       ['tree', 'navTree'],
-      ['workbench', 'navWorkbench'],
+      ['workbench', 'navWorkbenchLegacy'],
       ['create', 'navCreate'],
-    ],
-  },
-  {
-    id: 'collab',
-    labelKey: 'navGroupCollab',
-    items: [['collab', 'navCollab']],
-  },
-  {
-    id: 'tasks',
-    labelKey: 'navGroupTasks',
-    items: [['tasks', 'navTasks']],
-  },
-  {
-    id: 'verify',
-    labelKey: 'navGroupVerify',
-    items: [
+      ['collab', 'navCollab'],
+      ['tasks', 'navTasks'],
       ['deploy', 'navDeploy'],
       ['discover', 'navDiscover'],
-    ],
-  },
-  {
-    id: 'spaces',
-    labelKey: 'navGroupSpaces',
-    items: [
       ['spaces', 'navSpaces'],
       ['market', 'navMarket'],
-    ],
-  },
-  {
-    id: 'econ',
-    labelKey: 'navGroupEcon',
-    items: [
       ['equity', 'navEquity'],
       ['governance', 'navGovernance'],
       ['history', 'navHistory'],
@@ -50,6 +30,8 @@ const NAV_GROUPS = [
     ],
   },
 ];
+
+let studioMount = null;
 
 const COLLAB_STAGES = ['DRAFT', 'EXPLORING', 'VALIDATING', 'COMMITTED'];
 const SCENARIOS = ['PRODUCT', 'RESEARCH', 'HARDWARE'];
@@ -94,7 +76,7 @@ const SCENARIO_SEED_TITLES = {
 
 const state = {
   locale: localStorage.getItem('forge.locale') || 'zh',
-  page: localStorage.getItem('forge.page') || 'tree',
+  page: localStorage.getItem('forge.page') || 'studio',
   tenantId: localStorage.getItem('forge.tenant') || 'tenant.demo',
   actorId: localStorage.getItem('forge.actor') || 'user.demo',
   scenarioMode: localStorage.getItem('forge.scenario') || 'PRODUCT',
@@ -471,6 +453,10 @@ function setHeader(eyebrow, title, sub) {
 
 function navigate(page) {
   closeSse();
+  if (studioMount && page !== 'studio') {
+    studioMount.destroy();
+    studioMount = null;
+  }
   state.page = page;
   localStorage.setItem('forge.page', page);
   el('sidebar').classList.remove('open');
@@ -1144,6 +1130,8 @@ function renderTasks() {
       <div class="stat-label">${tt('scenarioWorkspace')}</div>
       <div class="stat-value cyan" style="font-size:1.1rem">${scenarioLabel(scenario)}</div>
       <p class="empty">${tt('tasksHint')}</p>
+      <p class="empty">${tt('tasksBelongProject')}</p>
+      <div class="btn-row"><button type="button" class="btn btn-cyan" id="tasks-to-studio">${tt('tasksOpenStudio')}</button></div>
     </div>
     <div class="panel">
       <label class="field"><span>${tt('navTasks')}</span>
@@ -1269,6 +1257,7 @@ function renderTasks() {
       } catch (error) { toast(error.message); }
     });
   });
+  el('tasks-to-studio')?.addEventListener('click', () => navigate('studio'));
 }
 
 function renderSpaceColumn(title, assets, spaceKey) {
@@ -2121,9 +2110,51 @@ function renderHistory() {
   });
 }
 
+async function renderStudio() {
+  setHeader(tt('studioEyebrow'), tt('studioTitle'), tt('studioSub'));
+  const content = el('content');
+  content.innerHTML = `<div class="studio-host" id="studio-host"><p class="empty">${tt('studioLoading')}</p></div>`;
+  if (studioMount) {
+    studioMount.destroy();
+    studioMount = null;
+  }
+  const host = el('studio-host');
+  const wbApi = async (method, path, body) => {
+    const key = `${method}:${path}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+    return api(method, path, {
+      ...(body !== undefined ? { body } : {}),
+      ...(method !== 'GET' ? { idempotencyKey: key } : {}),
+    });
+  };
+  try {
+    studioMount = await mountStudioWorkbench(host, {
+      intentId: WORKBENCH_INTENT_ID,
+      lang: state.locale === 'en' ? 'en' : 'zh',
+      api: wbApi,
+      headers: () => headers({}),
+      ensure: async () => {
+        await api('POST', '/v1/forge/workbench/ensure', {
+          body: { lang: state.locale === 'en' ? 'en' : 'zh' },
+          idempotencyKey: `wb-ensure:${state.actorId}`,
+        });
+      },
+      onLang: (lang) => {
+        state.locale = lang;
+        localStorage.setItem('forge.locale', lang);
+        applyChromeI18n();
+      },
+      onError: (err) => toast(err?.message || String(err)),
+    });
+  } catch (err) {
+    host.innerHTML = `<p class="empty">${tt('studioLoadError')}: ${err?.message || err}</p>`;
+    toast(err?.message || String(err));
+  }
+}
+
 function renderPage() {
   const map = {
     overview: renderOverview,
+    studio: () => { void renderStudio(); },
     tree: renderTree,
     workbench: renderWorkbench,
     collab: renderCollab,
@@ -2139,6 +2170,10 @@ function renderPage() {
     equity: renderEquity,
     history: renderHistory,
   };
+  if (state.page === 'studio') {
+    void renderStudio();
+    return;
+  }
   if (state.page === 'workbench') {
     void (async () => {
       await refreshVariantsAndJudgments();
@@ -2193,7 +2228,7 @@ function renderPage() {
     void refreshLifeforms().then(() => renderDeploy());
     return;
   }
-  (map[state.page] || renderTree)();
+  (map[state.page] || (() => { void renderStudio(); }))();
 }
 
 el('lang-zh').addEventListener('click', () => {

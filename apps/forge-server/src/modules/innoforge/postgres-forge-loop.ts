@@ -99,6 +99,33 @@ import {
   type ForgeTaskExecutor,
   type ForgeTaskStatus,
 } from './forge-tasks.js';
+import {
+  WORKBENCH_DEMO_INTENT_ID,
+  freezeWorkbenchState,
+  type WorkbenchRule,
+  type WorkbenchState,
+} from './forge-workbench.js';
+import {
+  acceptDeliveryWorkbench,
+  acceptWorkbench,
+  buildWorkbench,
+  deliveryZipWorkbench,
+  ensureWorkbench,
+  feedbackWorkbench,
+  getWorkbench,
+  patchWorkbench,
+  registerAssetWorkbench,
+  replyWorkbench,
+  resetWorkbench,
+  resolveFeedbackWorkbench,
+  returnWorkbench,
+  rulesWorkbench,
+  runWorkbenchChecks,
+  submitWorkbench,
+  withdrawWorkbench,
+  type WorkbenchPersistence,
+  type WorkbenchView,
+} from './forge-workbench-ops.js';
 
 type JudgmentRow = {
   id: string;
@@ -159,6 +186,117 @@ export class PostgresForgeLoopService implements ForgeLoopService {
     bridge?: ForgePxnBridge,
   ) {
     this.bridge = bridge ?? createPxnBridge();
+  }
+
+  private workbenchStore(): WorkbenchPersistence {
+    return {
+      load: async (intentId, tenantId) => {
+        const result = await this.pool.query(
+          `SELECT intent_id, tenant_id, state, updated_at, updated_by
+             FROM forge_workbench WHERE intent_id=$1 AND tenant_id=$2`,
+          [intentId, tenantId],
+        );
+        const row = result.rows[0] as {
+          intent_id: string;
+          tenant_id: string;
+          state: WorkbenchState;
+          updated_at: Date;
+          updated_by: string;
+        } | undefined;
+        if (!row) return undefined;
+        return Object.freeze({
+          intentId: row.intent_id,
+          tenantId: row.tenant_id,
+          state: freezeWorkbenchState(row.state),
+          updatedAt: new Date(row.updated_at).toISOString(),
+          updatedBy: row.updated_by,
+        });
+      },
+      save: async ({ intentId, tenantId, state, audit }) => {
+        const frozen = freezeWorkbenchState(state);
+        await this.pool.query(
+          `INSERT INTO forge_workbench (intent_id, tenant_id, state, updated_at, updated_by)
+           VALUES ($1,$2,$3::jsonb,$4::timestamptz,$5)
+           ON CONFLICT (intent_id) DO UPDATE SET
+             state = EXCLUDED.state,
+             updated_at = EXCLUDED.updated_at,
+             updated_by = EXCLUDED.updated_by,
+             tenant_id = EXCLUDED.tenant_id`,
+          [
+            intentId,
+            tenantId,
+            JSON.stringify(frozen),
+            audit.occurredAt,
+            audit.actorId,
+          ],
+        );
+        return Object.freeze({
+          intentId,
+          tenantId,
+          state: frozen,
+          updatedAt: audit.occurredAt,
+          updatedBy: audit.actorId,
+        });
+      },
+      ensureDemoIntent: async (audit) => {
+        await this.ensureAccount({
+          tenantId: audit.tenantId,
+          principalId: audit.actorId,
+          openingBalance: 5000,
+        });
+        try {
+          await this.requireIntent(WORKBENCH_DEMO_INTENT_ID, audit.tenantId);
+        } catch {
+          await this.createIntent({
+            id: WORKBENCH_DEMO_INTENT_ID,
+            statement: '轻舟项目 · 客户自助报价工具（工作室工作台演示）',
+            stake: 50,
+            constraints: [{ key: 'demo', op: '=', value: 'workbench', unit: 'flag' }],
+            scenario: 'PRODUCT',
+            audit: {
+              ...audit,
+              idempotencyKey: `${audit.idempotencyKey}:demo-intent`,
+            },
+          });
+        }
+        return { intentId: WORKBENCH_DEMO_INTENT_ID };
+      },
+      ensureTaskT01: async ({ intentId, audit }) => {
+        const listed = await this.listTasks({ intentId, tenantId: audit.tenantId });
+        const found = listed.find((t) => t.title === 'T-01' || t.title.includes('报价'));
+        if (found) return found;
+        const intent = await this.requireIntent(intentId, audit.tenantId);
+        const root = intent.intentTree.nodes.find((n) => n.kind === 'GOAL');
+        return this.createTask({
+          intentId,
+          title: 'T-01 可运行报价工具',
+          executor: 'AI',
+          ...(root ? { treeNodeId: root.id } : {}),
+          audit: {
+            ...audit,
+            idempotencyKey: `${audit.idempotencyKey}:task-t01`,
+          },
+        });
+      },
+      appendEvent: async ({ intentId, type, audit, payload }) => {
+        const client = await this.pool.connect();
+        try {
+          await client.query('BEGIN');
+          await this.insertEvent(client, intentId, type, audit, payload);
+          await this.appendDomainEvent(client, intentId, type, audit, payload);
+          await client.query(
+            `UPDATE forge_intents SET updated_at=$2::timestamptz WHERE id=$1`,
+            [intentId, audit.occurredAt],
+          );
+          await client.query('COMMIT');
+        } catch (error) {
+          await client.query('ROLLBACK');
+          throw error;
+        } finally {
+          client.release();
+        }
+      },
+    };
   }
 
   async ensureAccount(input: {
@@ -1744,6 +1882,134 @@ export class PostgresForgeLoopService implements ForgeLoopService {
       tenantId: input.tenantId,
       ...(input.locale !== undefined ? { locale: input.locale } : {}),
     });
+  }
+
+  async ensureWorkbench(input: {
+    intentId?: string;
+    lang?: 'zh' | 'en';
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return ensureWorkbench(this.workbenchStore(), input);
+  }
+
+  async getWorkbench(input: {
+    intentId: string;
+    tenantId: string;
+    lang?: 'zh' | 'en';
+    audit?: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return getWorkbench(this.workbenchStore(), input);
+  }
+
+  async patchWorkbench(input: {
+    intentId: string;
+    patch: Record<string, unknown>;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return patchWorkbench(this.workbenchStore(), input);
+  }
+
+  async acceptWorkbench(input: {
+    intentId: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return acceptWorkbench(this.workbenchStore(), input);
+  }
+
+  async buildWorkbench(input: {
+    intentId: string;
+    action?: 'start' | 'tick' | 'complete' | 'pause' | 'run';
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return buildWorkbench(this.workbenchStore(), input);
+  }
+
+  async runWorkbenchChecks(input: {
+    intentId: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return runWorkbenchChecks(this.workbenchStore(), input);
+  }
+
+  async feedbackWorkbench(input: {
+    intentId: string;
+    text: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return feedbackWorkbench(this.workbenchStore(), input);
+  }
+
+  async replyWorkbench(input: {
+    intentId: string;
+    response: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return replyWorkbench(this.workbenchStore(), input);
+  }
+
+  async rulesWorkbench(input: {
+    intentId: string;
+    rule: WorkbenchRule;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return rulesWorkbench(this.workbenchStore(), input);
+  }
+
+  async resolveFeedbackWorkbench(input: {
+    intentId: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return resolveFeedbackWorkbench(this.workbenchStore(), input);
+  }
+
+  async submitWorkbench(input: {
+    intentId: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return submitWorkbench(this.workbenchStore(), input);
+  }
+
+  async withdrawWorkbench(input: {
+    intentId: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return withdrawWorkbench(this.workbenchStore(), input);
+  }
+
+  async returnWorkbench(input: {
+    intentId: string;
+    text?: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return returnWorkbench(this.workbenchStore(), input);
+  }
+
+  async acceptDeliveryWorkbench(input: {
+    intentId: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return acceptDeliveryWorkbench(this.workbenchStore(), input);
+  }
+
+  async registerAssetWorkbench(input: {
+    intentId: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return registerAssetWorkbench(this.workbenchStore(), input);
+  }
+
+  async resetWorkbench(input: {
+    intentId: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return resetWorkbench(this.workbenchStore(), input);
+  }
+
+  async deliveryZipWorkbench(input: {
+    intentId: string;
+    tenantId: string;
+  }): Promise<{ filename: string; buffer: Buffer }> {
+    return deliveryZipWorkbench(this.workbenchStore(), input);
   }
 
   async getIntentTree(input: {

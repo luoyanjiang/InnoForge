@@ -86,6 +86,33 @@ import {
   type ForgeTaskExecutor,
   type ForgeTaskStatus,
 } from './forge-tasks.js';
+import {
+  WORKBENCH_DEMO_INTENT_ID,
+  freezeWorkbenchState,
+  type WorkbenchRule,
+  type WorkbenchState,
+} from './forge-workbench.js';
+import {
+  acceptDeliveryWorkbench,
+  acceptWorkbench,
+  buildWorkbench,
+  deliveryZipWorkbench,
+  ensureWorkbench,
+  feedbackWorkbench,
+  getWorkbench,
+  patchWorkbench,
+  registerAssetWorkbench,
+  replyWorkbench,
+  resetWorkbench,
+  resolveFeedbackWorkbench,
+  returnWorkbench,
+  rulesWorkbench,
+  runWorkbenchChecks,
+  submitWorkbench,
+  withdrawWorkbench,
+  type WorkbenchPersistence,
+  type WorkbenchView,
+} from './forge-workbench-ops.js';
 
 export type { ForgeConstraint } from './forge-constraints.js';
 export type { ForgeJudgment, ForgeJudgmentAction, ForgeVariantCandidate } from './forge-judgments.js';
@@ -330,6 +357,68 @@ export interface ForgeLoopService {
     tenantId: string;
     locale?: string;
   }): Promise<ForgeSpacesView>;
+  ensureWorkbench(input: {
+    intentId?: string;
+    lang?: 'zh' | 'en';
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView>;
+  getWorkbench(input: {
+    intentId: string;
+    tenantId: string;
+    lang?: 'zh' | 'en';
+    audit?: ForgeAudit;
+  }): Promise<WorkbenchView>;
+  patchWorkbench(input: {
+    intentId: string;
+    patch: Record<string, unknown>;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView>;
+  acceptWorkbench(input: { intentId: string; audit: ForgeAudit }): Promise<WorkbenchView>;
+  buildWorkbench(input: {
+    intentId: string;
+    action?: 'start' | 'tick' | 'complete' | 'pause' | 'run';
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView>;
+  runWorkbenchChecks(input: { intentId: string; audit: ForgeAudit }): Promise<WorkbenchView>;
+  feedbackWorkbench(input: {
+    intentId: string;
+    text: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView>;
+  replyWorkbench(input: {
+    intentId: string;
+    response: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView>;
+  rulesWorkbench(input: {
+    intentId: string;
+    rule: WorkbenchRule;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView>;
+  resolveFeedbackWorkbench(input: {
+    intentId: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView>;
+  submitWorkbench(input: { intentId: string; audit: ForgeAudit }): Promise<WorkbenchView>;
+  withdrawWorkbench(input: { intentId: string; audit: ForgeAudit }): Promise<WorkbenchView>;
+  returnWorkbench(input: {
+    intentId: string;
+    text?: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView>;
+  acceptDeliveryWorkbench(input: {
+    intentId: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView>;
+  registerAssetWorkbench(input: {
+    intentId: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView>;
+  resetWorkbench(input: { intentId: string; audit: ForgeAudit }): Promise<WorkbenchView>;
+  deliveryZipWorkbench(input: {
+    intentId: string;
+    tenantId: string;
+  }): Promise<{ filename: string; buffer: Buffer }>;
 }
 
 export class ForgeLoopError extends Error {
@@ -365,6 +454,7 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
   private readonly lifeforms = new Map<string, ForgeLifeform>();
   private readonly memories = new Map<string, ForgeMemory>();
   private readonly tasks = new Map<string, ForgeTask>();
+  private readonly workbenches = new Map<string, WorkbenchView>();
   private readonly bridge: ForgePxnBridge;
 
   constructor(
@@ -372,6 +462,73 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
     bridge?: ForgePxnBridge,
   ) {
     this.bridge = bridge ?? new InMemoryForgePxnBridge();
+  }
+
+  private workbenchStore(): WorkbenchPersistence {
+    return {
+      load: async (intentId, tenantId) => {
+        const row = this.workbenches.get(intentId);
+        if (!row || row.tenantId !== tenantId) return undefined;
+        return row;
+      },
+      save: async ({ intentId, tenantId, state, audit }) => {
+        const view: WorkbenchView = Object.freeze({
+          intentId,
+          tenantId,
+          state: freezeWorkbenchState(state),
+          updatedAt: audit.occurredAt,
+          updatedBy: audit.actorId,
+        });
+        this.workbenches.set(intentId, view);
+        return view;
+      },
+      ensureDemoIntent: async (audit) => {
+        await this.ensureAccount({
+          tenantId: audit.tenantId,
+          principalId: audit.actorId,
+          openingBalance: 5000,
+        });
+        const existing = await this.get({
+          id: WORKBENCH_DEMO_INTENT_ID,
+          tenantId: audit.tenantId,
+        });
+        if (!existing) {
+          await this.createIntent({
+            id: WORKBENCH_DEMO_INTENT_ID,
+            statement: '轻舟项目 · 客户自助报价工具（工作室工作台演示）',
+            stake: 50,
+            constraints: [{ key: 'demo', op: '=', value: 'workbench', unit: 'flag' }],
+            scenario: 'PRODUCT',
+            audit: {
+              ...audit,
+              idempotencyKey: `${audit.idempotencyKey}:demo-intent`,
+            },
+          });
+        }
+        return { intentId: WORKBENCH_DEMO_INTENT_ID };
+      },
+      ensureTaskT01: async ({ intentId, audit }) => {
+        const listed = await this.listTasks({ intentId, tenantId: audit.tenantId });
+        const found = listed.find((t) => t.title === 'T-01' || t.title.includes('报价'));
+        if (found) return found;
+        const intent = await this.get({ id: intentId, tenantId: audit.tenantId });
+        if (!intent) throw new ForgeLoopError('INTENT_NOT_FOUND');
+        const root = intent.intentTree.nodes.find((n) => n.kind === 'GOAL');
+        return this.createTask({
+          intentId,
+          title: 'T-01 可运行报价工具',
+          executor: 'AI',
+          ...(root ? { treeNodeId: root.id } : {}),
+          audit: {
+            ...audit,
+            idempotencyKey: `${audit.idempotencyKey}:task-t01`,
+          },
+        });
+      },
+      appendEvent: async ({ intentId, type, audit, payload }) => {
+        this.appendIntentEvent(intentId, audit, type, payload);
+      },
+    };
   }
 
   private resolveConfirmer(intent: ForgeIntent): string {
@@ -1486,6 +1643,134 @@ export class InMemoryForgeLoopService implements ForgeLoopService {
       tenantId: input.tenantId,
       ...(input.locale !== undefined ? { locale: input.locale } : {}),
     });
+  }
+
+  async ensureWorkbench(input: {
+    intentId?: string;
+    lang?: 'zh' | 'en';
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return ensureWorkbench(this.workbenchStore(), input);
+  }
+
+  async getWorkbench(input: {
+    intentId: string;
+    tenantId: string;
+    lang?: 'zh' | 'en';
+    audit?: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return getWorkbench(this.workbenchStore(), input);
+  }
+
+  async patchWorkbench(input: {
+    intentId: string;
+    patch: Record<string, unknown>;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return patchWorkbench(this.workbenchStore(), input);
+  }
+
+  async acceptWorkbench(input: {
+    intentId: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return acceptWorkbench(this.workbenchStore(), input);
+  }
+
+  async buildWorkbench(input: {
+    intentId: string;
+    action?: 'start' | 'tick' | 'complete' | 'pause' | 'run';
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return buildWorkbench(this.workbenchStore(), input);
+  }
+
+  async runWorkbenchChecks(input: {
+    intentId: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return runWorkbenchChecks(this.workbenchStore(), input);
+  }
+
+  async feedbackWorkbench(input: {
+    intentId: string;
+    text: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return feedbackWorkbench(this.workbenchStore(), input);
+  }
+
+  async replyWorkbench(input: {
+    intentId: string;
+    response: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return replyWorkbench(this.workbenchStore(), input);
+  }
+
+  async rulesWorkbench(input: {
+    intentId: string;
+    rule: WorkbenchRule;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return rulesWorkbench(this.workbenchStore(), input);
+  }
+
+  async resolveFeedbackWorkbench(input: {
+    intentId: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return resolveFeedbackWorkbench(this.workbenchStore(), input);
+  }
+
+  async submitWorkbench(input: {
+    intentId: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return submitWorkbench(this.workbenchStore(), input);
+  }
+
+  async withdrawWorkbench(input: {
+    intentId: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return withdrawWorkbench(this.workbenchStore(), input);
+  }
+
+  async returnWorkbench(input: {
+    intentId: string;
+    text?: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return returnWorkbench(this.workbenchStore(), input);
+  }
+
+  async acceptDeliveryWorkbench(input: {
+    intentId: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return acceptDeliveryWorkbench(this.workbenchStore(), input);
+  }
+
+  async registerAssetWorkbench(input: {
+    intentId: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return registerAssetWorkbench(this.workbenchStore(), input);
+  }
+
+  async resetWorkbench(input: {
+    intentId: string;
+    audit: ForgeAudit;
+  }): Promise<WorkbenchView> {
+    return resetWorkbench(this.workbenchStore(), input);
+  }
+
+  async deliveryZipWorkbench(input: {
+    intentId: string;
+    tenantId: string;
+  }): Promise<{ filename: string; buffer: Buffer }> {
+    return deliveryZipWorkbench(this.workbenchStore(), input);
   }
 
   async getIntentTree(input: {
