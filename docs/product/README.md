@@ -9,7 +9,7 @@
 | 用途 | 链接 |
 |------|------|
 | **整包 ZIP（推荐手机下载）** | [Release `product-docs-2026-10-22`](https://github.com/luoyanjiang/InnoForge/releases/tag/product-docs-2026-10-22) → 资源 `InnoForge-产品文档-20261022.zip` |
-| ZIP 直链（raw） | https://github.com/luoyanjiang/InnoForge/releases/download/product-docs-2026-10-22/InnoForge-%E4%BA%A7%E5%93%81%E6%96%87%E6%A1%A3-20261022.zip |
+| ZIP 直链（raw） | https://github.com/luoyanjiang/InnoForge/releases/download/product-docs-2026-10-22/InnoForge-product-docs-20261022.zip |
 | **合集 Markdown（一页读完）** | [innoforge-product-docs-pack.md](./innoforge-product-docs-pack.md) · [raw](https://raw.githubusercontent.com/luoyanjiang/InnoForge/main/docs/product/innoforge-product-docs-pack.md) |
 | **总索引** | [innoforge-product-docs-index.md](./innoforge-product-docs-index.md) · [raw](https://raw.githubusercontent.com/luoyanjiang/InnoForge/main/docs/product/innoforge-product-docs-index.md) |
 
