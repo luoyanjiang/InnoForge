@@ -334,6 +334,35 @@ export function registerForgeRoutes(app: FastifyInstance, service: ForgeLoopServ
 
   app.get<{
     Headers: Pick<Headers, 'x-actor-id' | 'x-tenant-id'>;
+    Querystring: { intent_id?: string };
+  }>('/v1/forge/timeline', {
+    schema: {
+      operationId: 'getForgeTimeline',
+      summary: 'Intent & judgment history timeline (G3) — merge events + judgments',
+      tags: ['InnoForge'],
+      headers: readHeaders,
+      querystring: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { intent_id: id },
+      },
+      response: { 200: response, 404: errorResponse, 403: errorResponse },
+    },
+  }, async (request, reply) => {
+    try {
+      return reply.send({
+        items: await service.listTimeline({
+          tenantId: request.headers['x-tenant-id'],
+          ...(request.query.intent_id ? { intentId: request.query.intent_id } : {}),
+        }),
+      });
+    } catch (error) {
+      return fail(request, reply, error);
+    }
+  });
+
+  app.get<{
+    Headers: Pick<Headers, 'x-actor-id' | 'x-tenant-id'>;
     Params: { intentId: string };
   }>('/v1/forge/intents/:intentId/judgments', {
     schema: {

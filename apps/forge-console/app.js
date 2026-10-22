@@ -12,6 +12,7 @@ const NAV = [
   ['connections', 'navConnections'],
   ['governance', 'navGovernance'],
   ['equity', 'navEquity'],
+  ['history', 'navHistory'],
 ];
 
 const state = {
@@ -26,6 +27,8 @@ const state = {
   selectedIntentId: localStorage.getItem('forge.intent') || null,
   variants: [],
   judgments: [],
+  timeline: [],
+  historyFilter: localStorage.getItem('forge.historyFilter') || 'all',
   lumenLog: [],
   marketOwned: JSON.parse(localStorage.getItem('forge.market') || 'false'),
   connFilter: 'all',
@@ -109,6 +112,71 @@ async function recordJudgment(candidateId, action) {
   });
   await refreshVariantsAndJudgments();
   return judgment;
+}
+
+async function refreshTimeline() {
+  const filter = state.historyFilter;
+  const intentId = filter === 'selected'
+    ? (selectedIntent()?.id || null)
+    : (filter !== 'all' ? filter : null);
+  const qs = intentId ? `?intent_id=${encodeURIComponent(intentId)}` : '';
+  try {
+    const data = await api('GET', `/v1/forge/timeline${qs}`);
+    state.timeline = data.items || [];
+  } catch {
+    state.timeline = [];
+  }
+}
+
+function timelineKindLabel(kind) {
+  const key = ({
+    CREATED: 'tlCreated',
+    UPDATED: 'tlUpdated',
+    FROZEN: 'tlFrozen',
+    UNFROZEN: 'tlUnfrozen',
+    JUDGMENT: 'tlJudgment',
+    CONFIRMED: 'tlConfirmed',
+    DEPLOYED: 'tlDeployed',
+    FEEDBACK: 'tlFeedback',
+    SETTLED: 'tlSettled',
+    OTHER: 'tlOther',
+  })[kind] || 'tlOther';
+  return tt(key);
+}
+
+function timelineKindClass(kind) {
+  return ({
+    CREATED: 'tl-created',
+    UPDATED: 'tl-updated',
+    FROZEN: 'tl-frozen',
+    UNFROZEN: 'tl-unfrozen',
+    JUDGMENT: 'tl-judgment',
+    CONFIRMED: 'tl-confirmed',
+    DEPLOYED: 'tl-deployed',
+    FEEDBACK: 'tl-feedback',
+    SETTLED: 'tl-settled',
+    OTHER: 'tl-other',
+  })[kind] || 'tl-other';
+}
+
+function timelineSummary(item) {
+  const p = item.payload || {};
+  if (item.kind === 'JUDGMENT') {
+    const title = state.locale === 'zh'
+      ? (p.candidateTitleZh || p.candidateId || '')
+      : (p.candidateTitleEn || p.candidateId || '');
+    return `${p.action || ''} · ${title} · ${item.actorId}`;
+  }
+  if (item.kind === 'CREATED') {
+    return `${tt('tlStake')}: ${p.stake ?? '—'} · ${item.actorId}`;
+  }
+  if (item.kind === 'SETTLED') {
+    return `${tt('minted')}: +${p.creditMinted ?? p.minted ?? '—'} · ${item.actorId}`;
+  }
+  if (item.kind === 'DEPLOYED') {
+    return `${p.adapterId || p.jobId || item.eventType || ''} · ${item.actorId}`;
+  }
+  return `${item.eventType || item.kind} · ${item.actorId}`;
 }
 
 const CONSTRAINT_OPS = ['<=', '>=', '<', '>', '=', '~'];
@@ -951,6 +1019,51 @@ function renderEquity() {
     </div>`;
 }
 
+function renderHistory() {
+  setHeader(tt('navHistory'), tt('historyTitle'), tt('historySub'));
+  const filter = state.historyFilter;
+  const options = [
+    ['all', tt('historyAll')],
+    ['selected', tt('historyCurrent')],
+    ...state.intents.map((intent) => [intent.id, intent.statement.slice(0, 36) || intent.id]),
+  ];
+  const items = state.timeline;
+  el('content').innerHTML = `
+    <div class="history-toolbar">
+      <label class="field history-filter">
+        <span>${tt('historyFilter')}</span>
+        <select id="history-filter">
+          ${options.map(([value, label]) => `
+            <option value="${escapeAttr(value)}" ${filter === value ? 'selected' : ''}>${escapeAttr(label)}</option>
+          `).join('')}
+        </select>
+      </label>
+      <button type="button" class="btn btn-ghost" id="history-refresh">${tt('refresh')}</button>
+    </div>
+    <div class="timeline" id="history-timeline">
+      ${items.length ? items.map((item, index) => `
+        <article class="timeline-card panel ${timelineKindClass(item.kind)}" style="animation-delay:${Math.min(index, 12) * 40}ms">
+          <div class="timeline-kind">${timelineKindLabel(item.kind)}</div>
+          <div class="timeline-body">${escapeAttr(timelineSummary(item))}</div>
+          <div class="timeline-meta">
+            <span class="mono">${escapeAttr(item.intentId)}</span>
+            <span>${(item.at || '').replace('T', ' ').replace(/\.\d+Z$/, 'Z')}</span>
+          </div>
+        </article>`).join('') : `<p class="empty">${tt('historyEmpty')}</p>`}
+    </div>`;
+  el('history-filter')?.addEventListener('change', (event) => {
+    state.historyFilter = event.target.value;
+    localStorage.setItem('forge.historyFilter', state.historyFilter);
+    void refreshTimeline().then(() => renderHistory());
+  });
+  el('history-refresh')?.addEventListener('click', () => {
+    void refreshTimeline().then(() => {
+      toast(tt('historyRefreshed'));
+      renderHistory();
+    });
+  });
+}
+
 function renderPage() {
   const map = {
     overview: renderOverview,
@@ -964,9 +1077,14 @@ function renderPage() {
     connections: renderConnections,
     governance: renderGovernance,
     equity: renderEquity,
+    history: renderHistory,
   };
   if (state.page === 'workbench') {
     void refreshVariantsAndJudgments().then(() => renderWorkbench());
+    return;
+  }
+  if (state.page === 'history') {
+    void refreshTimeline().then(() => renderHistory());
     return;
   }
   (map[state.page] || renderOverview)();
