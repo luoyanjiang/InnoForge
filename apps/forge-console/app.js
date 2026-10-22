@@ -31,6 +31,8 @@ const state = {
   historyFilter: localStorage.getItem('forge.historyFilter') || 'all',
   allocationWeights: { proposer: 38.5, suggester: 32, confirmer: 29.5 },
   allocationsByIntent: {},
+  snapshots: [],
+  snapshotIntentId: localStorage.getItem('forge.snapshotIntent') || null,
   lumenLog: [],
   marketOwned: JSON.parse(localStorage.getItem('forge.market') || 'false'),
   connFilter: 'all',
@@ -141,6 +143,8 @@ function timelineKindLabel(kind) {
     DEPLOYED: 'tlDeployed',
     FEEDBACK: 'tlFeedback',
     SETTLED: 'tlSettled',
+    SNAPSHOT: 'tlSnapshot',
+    ROLLED_BACK: 'tlRolledBack',
     OTHER: 'tlOther',
   })[kind] || 'tlOther';
   return tt(key);
@@ -157,6 +161,8 @@ function timelineKindClass(kind) {
     DEPLOYED: 'tl-deployed',
     FEEDBACK: 'tl-feedback',
     SETTLED: 'tl-settled',
+    SNAPSHOT: 'tl-snapshot',
+    ROLLED_BACK: 'tl-rolled-back',
     OTHER: 'tl-other',
   })[kind] || 'tl-other';
 }
@@ -959,9 +965,29 @@ function renderConnections() {
   });
 }
 
+async function refreshSnapshots() {
+  const eligible = state.intents.filter((i) => i.status === 'STAKED' || i.status === 'CONFIRMED');
+  if (!state.snapshotIntentId || !eligible.some((i) => i.id === state.snapshotIntentId)) {
+    state.snapshotIntentId = eligible[0]?.id || null;
+    if (state.snapshotIntentId) localStorage.setItem('forge.snapshotIntent', state.snapshotIntentId);
+  }
+  if (!state.snapshotIntentId) {
+    state.snapshots = [];
+    return;
+  }
+  try {
+    const data = await api('GET', `/v1/forge/intents/${encodeURIComponent(state.snapshotIntentId)}/snapshots`);
+    state.snapshots = data.snapshots || [];
+  } catch {
+    state.snapshots = [];
+  }
+}
+
 function renderGovernance() {
   setHeader(tt('navGovernance'), tt('govTitle'), tt('govSub'));
   const pending = state.intents.filter((i) => i.status === 'STAKED');
+  const snapshotEligible = state.intents.filter((i) => i.status === 'STAKED' || i.status === 'CONFIRMED');
+  const snapIntent = snapshotEligible.find((i) => i.id === state.snapshotIntentId) || null;
   const audit = state.intents.flatMap((i) => (i.events || []).map((e) => ({ ...e, intentId: i.id })))
     .sort((a, b) => b.at.localeCompare(a.at))
     .slice(0, 12);
@@ -983,6 +1009,38 @@ function renderGovernance() {
         <h3>${tt('audit')}</h3>
         ${audit.length ? audit.map((e) => `<div class="list-row"><span class="mono">${e.type}</span><span>${e.at.slice(11, 19)}</span></div>`).join('') : `<p class="empty">—</p>`}
       </div>
+    </div>
+    <div class="panel" style="margin-top:0.85rem" id="snapshot-panel">
+      <h3>${tt('snapshotTitle')}</h3>
+      <p class="empty">${tt('snapshotHint')}</p>
+      <label class="field">
+        <span>${tt('snapshotIntent')}</span>
+        <select id="snapshot-intent">
+          ${snapshotEligible.length
+            ? snapshotEligible.map((i) => `
+              <option value="${escapeAttr(i.id)}" ${i.id === state.snapshotIntentId ? 'selected' : ''}>
+                ${escapeAttr(i.statement.slice(0, 40))} · ${i.status}
+              </option>`).join('')
+            : `<option value="">${tt('snapshotNoEligible')}</option>`}
+        </select>
+      </label>
+      ${snapIntent?.pxnTaskId ? `<div class="stat-sub mono">${tt('snapshotPxnHint')}: ${escapeAttr(snapIntent.pxnTaskId)}</div>` : ''}
+      <div class="btn-row" style="margin:0.65rem 0">
+        <button type="button" class="btn btn-primary" id="snapshot-create" ${snapIntent ? '' : 'disabled'}>${tt('snapshotCreate')}</button>
+        <button type="button" class="btn btn-ghost" id="snapshot-refresh" ${snapIntent ? '' : 'disabled'}>${tt('refresh')}</button>
+      </div>
+      <div id="snapshot-list">
+        ${state.snapshots.length ? state.snapshots.map((s) => `
+          <div class="list-row snapshot-row">
+            <span>
+              <span class="mono">${escapeAttr(s.contentHash.slice(0, 10))}…</span>
+              · ${(s.createdAt || '').slice(0, 19).replace('T', ' ')}
+              · ${escapeAttr(s.createdBy)}
+              ${s.pxnTaskId ? `<div class="stat-sub mono">${tt('snapshotPxnHint')}: ${escapeAttr(s.pxnTaskId)}</div>` : ''}
+            </span>
+            <button type="button" class="btn btn-warn" data-restore="${escapeAttr(s.id)}">${tt('snapshotRestore')}</button>
+          </div>`).join('') : `<p class="empty">${tt('snapshotEmpty')}</p>`}
+      </div>
     </div>`;
   state.roomLogs.governance.forEach((m) => appendRoomLog('governance', m));
   connectSse('governance');
@@ -997,7 +1055,7 @@ function renderGovernance() {
       });
       await refreshIntents();
       toast(tt('approve'));
-      renderGovernance();
+      void refreshSnapshots().then(() => renderGovernance());
     } catch (error) { toast(error.message); }
   }));
   el('gov-send')?.addEventListener('click', async () => {
@@ -1009,6 +1067,39 @@ function renderGovernance() {
     });
     el('gov-text').value = '';
   });
+  el('snapshot-intent')?.addEventListener('change', (event) => {
+    state.snapshotIntentId = event.target.value || null;
+    if (state.snapshotIntentId) localStorage.setItem('forge.snapshotIntent', state.snapshotIntentId);
+    void refreshSnapshots().then(() => renderGovernance());
+  });
+  el('snapshot-create')?.addEventListener('click', async () => {
+    if (!state.snapshotIntentId) return;
+    try {
+      await api('POST', `/v1/forge/intents/${encodeURIComponent(state.snapshotIntentId)}/snapshots`, {
+        idempotencyKey: `snap:${state.snapshotIntentId}:${Date.now()}`,
+      });
+      await refreshIntents();
+      await refreshSnapshots();
+      toast(tt('snapshotCreated'));
+      renderGovernance();
+    } catch (error) { toast(error.message); }
+  });
+  el('snapshot-refresh')?.addEventListener('click', () => {
+    void refreshSnapshots().then(() => renderGovernance());
+  });
+  el('content').querySelectorAll('[data-restore]').forEach((btn) => btn.addEventListener('click', async () => {
+    if (!state.snapshotIntentId) return;
+    if (!window.confirm(tt('snapshotConfirm'))) return;
+    try {
+      await api('POST', `/v1/forge/intents/${encodeURIComponent(state.snapshotIntentId)}/snapshots/${encodeURIComponent(btn.dataset.restore)}/restore`, {
+        idempotencyKey: `restore:${btn.dataset.restore}:${Date.now()}`,
+      });
+      await refreshIntents();
+      await refreshSnapshots();
+      toast(tt('snapshotRestored'));
+      renderGovernance();
+    } catch (error) { toast(error.message); }
+  }));
 }
 
 async function refreshAllocations() {
@@ -1141,6 +1232,10 @@ function renderPage() {
   }
   if (state.page === 'equity') {
     void refreshAllocations().then(() => renderEquity());
+    return;
+  }
+  if (state.page === 'governance') {
+    void refreshSnapshots().then(() => renderGovernance());
     return;
   }
   (map[state.page] || renderOverview)();

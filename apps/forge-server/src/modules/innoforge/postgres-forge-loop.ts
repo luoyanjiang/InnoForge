@@ -31,6 +31,7 @@ import {
   type ForgeCreditAllocation,
   type ForgeAllocationWeights,
   type ForgeReputation,
+  type ForgeSnapshot,
   DEFAULT_ALLOCATION_WEIGHTS,
 } from './forge-loop.js';
 import {
@@ -48,6 +49,13 @@ import {
   buildReputation,
   computeReputationScore,
 } from './forge-reputation.js';
+import {
+  freezeSnapshot,
+  hashSnapshotContent,
+  snapshotIdFor,
+  summarizeJudgments,
+  type ForgeSnapshotJudgmentSummary,
+} from './forge-snapshots.js';
 
 type JudgmentRow = {
   id: string;
@@ -700,6 +708,162 @@ export class PostgresForgeLoopService implements ForgeLoopService {
       amount: Number(row.amount),
       occurredAt: new Date(row.occurred_at).toISOString(),
     }));
+  }
+
+  private snapshotFromRow(row: {
+    id: string;
+    intent_id: string;
+    tenant_id: string;
+    statement: string;
+    constraints: ForgeConstraint[];
+    frozen: boolean;
+    judgments_summary: ForgeSnapshotJudgmentSummary[];
+    content_hash: string;
+    pxn_task_id: string | null;
+    created_at: Date;
+    created_by: string;
+  }): ForgeSnapshot {
+    return freezeSnapshot({
+      id: row.id,
+      intentId: row.intent_id,
+      tenantId: row.tenant_id,
+      statement: row.statement,
+      constraints: normalizeConstraints(row.constraints),
+      frozen: row.frozen,
+      judgmentsSummary: Object.freeze([...row.judgments_summary]),
+      contentHash: row.content_hash,
+      ...(row.pxn_task_id ? { pxnTaskId: row.pxn_task_id } : {}),
+      createdAt: new Date(row.created_at).toISOString(),
+      createdBy: row.created_by,
+    });
+  }
+
+  async createSnapshot(input: { intentId: string; audit: ForgeAudit }): Promise<ForgeSnapshot> {
+    const intent = await this.requireIntent(input.intentId, input.audit.tenantId);
+    if (intent.status !== 'STAKED' && intent.status !== 'CONFIRMED') {
+      throw new ForgeLoopError('SNAPSHOT_NOT_ALLOWED');
+    }
+    const judgments = await this.listJudgments({
+      intentId: input.intentId,
+      tenantId: input.audit.tenantId,
+    });
+    const judgmentsSummary = summarizeJudgments(judgments);
+    const contentHash = hashSnapshotContent({
+      statement: intent.statement,
+      constraints: intent.constraints,
+      frozen: intent.frozen,
+      judgmentsSummary,
+    });
+    const id = snapshotIdFor(input.intentId, contentHash, input.audit.occurredAt);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `INSERT INTO forge_snapshots
+          (id, intent_id, tenant_id, statement, constraints, frozen, judgments_summary,
+           content_hash, pxn_task_id, created_at, created_by)
+         VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7::jsonb,$8,$9,$10::timestamptz,$11)`,
+        [
+          id,
+          input.intentId,
+          input.audit.tenantId,
+          intent.statement,
+          JSON.stringify(intent.constraints),
+          intent.frozen,
+          JSON.stringify(judgmentsSummary),
+          contentHash,
+          intent.pxnTaskId ?? null,
+          input.audit.occurredAt,
+          input.audit.actorId,
+        ],
+      );
+      const payload = {
+        snapshotId: id,
+        contentHash,
+        pxnTaskId: intent.pxnTaskId ?? null,
+      };
+      await this.insertEvent(client, input.intentId, 'forge.intent.snapshot_taken', input.audit, payload);
+      await this.appendDomainEvent(client, input.intentId, 'forge.intent.snapshot_taken', input.audit, payload);
+      await client.query(
+        `UPDATE forge_intents SET updated_at=$2::timestamptz WHERE id=$1`,
+        [input.intentId, input.audit.occurredAt],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    const created = await this.pool.query(
+      `SELECT * FROM forge_snapshots WHERE id=$1`,
+      [id],
+    );
+    if (!created.rows[0]) throw new ForgeLoopError('SNAPSHOT_NOT_FOUND');
+    return this.snapshotFromRow(created.rows[0]);
+  }
+
+  async listSnapshots(input: {
+    intentId: string;
+    tenantId: string;
+  }): Promise<readonly ForgeSnapshot[]> {
+    await this.requireIntent(input.intentId, input.tenantId);
+    const result = await this.pool.query(
+      `SELECT * FROM forge_snapshots
+        WHERE intent_id=$1 AND tenant_id=$2
+        ORDER BY created_at DESC, id`,
+      [input.intentId, input.tenantId],
+    );
+    return result.rows.map((row) => this.snapshotFromRow(row));
+  }
+
+  async restoreSnapshot(input: {
+    intentId: string;
+    snapshotId: string;
+    audit: ForgeAudit;
+  }): Promise<ForgeIntent> {
+    const intent = await this.requireIntent(input.intentId, input.audit.tenantId);
+    if (intent.status !== 'STAKED' && intent.status !== 'CONFIRMED') {
+      throw new ForgeLoopError('ROLLBACK_NOT_ALLOWED');
+    }
+    const snapResult = await this.pool.query(
+      `SELECT * FROM forge_snapshots WHERE id=$1 AND intent_id=$2 AND tenant_id=$3`,
+      [input.snapshotId, input.intentId, input.audit.tenantId],
+    );
+    if (!snapResult.rows[0]) throw new ForgeLoopError('SNAPSHOT_NOT_FOUND');
+    const snapshot = this.snapshotFromRow(snapResult.rows[0]);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE forge_intents
+            SET statement=$2, constraints=$3::jsonb, frozen=$4, updated_at=$5::timestamptz
+          WHERE id=$1`,
+        [
+          input.intentId,
+          snapshot.statement,
+          JSON.stringify(snapshot.constraints),
+          snapshot.frozen,
+          input.audit.occurredAt,
+        ],
+      );
+      const payload = {
+        snapshotId: snapshot.id,
+        contentHash: snapshot.contentHash,
+        pxnTaskId: intent.pxnTaskId ?? snapshot.pxnTaskId ?? null,
+        previousStatement: intent.statement,
+        restoredStatement: snapshot.statement,
+      };
+      await this.insertEvent(client, input.intentId, 'forge.intent.rolled_back', input.audit, payload);
+      await this.appendDomainEvent(client, input.intentId, 'forge.intent.rolled_back', input.audit, payload);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    return this.requireIntent(input.intentId, input.audit.tenantId);
   }
 
   async recordJudgment(input: {
