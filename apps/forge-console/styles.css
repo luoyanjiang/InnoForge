@@ -90,6 +90,7 @@ button { cursor: pointer; border: 0; }
   letter-spacing: -0.03em;
   line-height: 1.1;
 }
+.tagline:empty { display: none; }
 .tagline {
   margin: 0.45rem 0 0;
   color: var(--muted);

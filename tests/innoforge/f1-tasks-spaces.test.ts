@@ -198,8 +198,8 @@ test('F1 HTTP tasks + spaces routes + create-flow shell markers', async () => {
     assert.match(i18n.body, /navGroupIntent/);
     assert.match(i18n.body, /navTasks/);
     assert.match(i18n.body, /navSpaces/);
-    assert.match(i18n.body, /创造流程操作系统/);
-    assert.match(i18n.body, /Create-flow operating system/);
+    assert.match(i18n.body, /brand: 'InnoForge'/);
+    assert.match(i18n.body, /tagline: ''/);
 
     const consoleJs = await app.inject({ method: 'GET', url: '/forge/app.js' });
     assert.match(consoleJs.body, /NAV_GROUPS/);
