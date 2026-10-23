@@ -176,8 +176,8 @@ test('V1 HTTP tree/scenario/stage + i18n nav', async () => {
 
     const i18n = await app.inject({ method: 'GET', url: '/forge/i18n.js' });
     assert.match(i18n.body, /navTree/);
-    assert.match(i18n.body, /意图树/);
-    assert.match(i18n.body, /Intent tree/);
+    assert.match(i18n.body, /目标树/);
+    assert.match(i18n.body, /Goal tree/);
     assert.match(i18n.body, /collabStageTitle/);
 
     const consoleJs = await app.inject({ method: 'GET', url: '/forge/app.js' });
