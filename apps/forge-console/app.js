@@ -2,41 +2,39 @@ import { t } from './i18n.js';
 import { mountStudioWorkbench, WORKBENCH_INTENT_ID } from './workbench.js';
 
 /**
- * P1 product shell — projects + my-tasks primary; Intent OS under 闭环.
- * No top-level task space. Validate tab deep-links into studio workbench.
+ * P1.1 shell IA — land on last project validate surface.
+ * Project = stage; Space = asset library; scenario off primary nav.
+ * Intent OS collapsed under 闭环. No top-level task space.
  */
+const NAV_PRIMARY = [
+  ['project', 'navProjects'],
+  ['mytasks', 'navMyTasks'],
+  ['assets', 'navAssets'],
+];
+
+const NAV_LOOP = [
+  ['workbench', 'navWorkbenchLegacy'],
+  ['tree', 'navTree'],
+  ['deploy', 'navDeploy'],
+  ['equity', 'navEquity'],
+  ['governance', 'navGovernance'],
+  ['account', 'navAccount'],
+  ['connections', 'navConnections'],
+  ['history', 'navHistory'],
+];
+
+/** Kept for tests / legacy references that scan NAV_GROUPS shape. */
 const NAV_GROUPS = [
-  {
-    id: 'primary',
-    labelKey: 'navGroupPrimary',
-    items: [
-      ['projects', 'navProjects'],
-      ['mytasks', 'navMyTasks'],
-    ],
-  },
-  {
-    id: 'loop',
-    labelKey: 'navGroupLoop',
-    items: [
-      ['workbench', 'navWorkbenchLegacy'],
-      ['tree', 'navTree'],
-      ['deploy', 'navDeploy'],
-      ['equity', 'navEquity'],
-      ['governance', 'navGovernance'],
-      ['account', 'navAccount'],
-      ['connections', 'navConnections'],
-      ['history', 'navHistory'],
-      ['overview', 'navOverview'],
-    ],
-  },
+  { id: 'primary', labelKey: 'navGroupPrimary', items: NAV_PRIMARY },
+  { id: 'loop', labelKey: 'navGroupLoop', items: NAV_LOOP },
 ];
 
 const PROJECT_TABS = [
-  ['overview', 'projectTabOverview'],
-  ['intent', 'projectTabIntent'],
   ['validate', 'projectTabValidate'],
   ['evidence', 'projectTabEvidence'],
+  ['intent', 'projectTabIntent'],
   ['assets', 'projectTabAssets'],
+  ['overview', 'projectTabOverview'],
 ];
 
 let studioMount = null;
@@ -83,7 +81,18 @@ const SCENARIO_SEED_TITLES = {
 };
 
 function migrateShellPage(raw) {
-  if (!raw || raw === 'studio' || raw === 'tasks') return 'projects';
+  // P1.1: default land = last project work surface, not projects list
+  if (!raw || raw === 'studio' || raw === 'tasks' || raw === 'projects') return 'project';
+  if (raw === 'overview') return 'project';
+  return raw;
+}
+
+function migrateProjectTab(raw) {
+  if (!localStorage.getItem('forge.iaP11')) {
+    localStorage.setItem('forge.iaP11', '1');
+    return 'validate';
+  }
+  if (!raw || raw === 'overview') return 'validate';
   return raw;
 }
 
@@ -96,8 +105,11 @@ const state = {
   projects: [],
   myTasks: [],
   selectedProjectId: localStorage.getItem('forge.projectId') || WORKBENCH_INTENT_ID,
-  projectTab: localStorage.getItem('forge.projectTab') || 'validate',
+  projectTab: migrateProjectTab(localStorage.getItem('forge.projectTab')),
   projectWorkbench: null,
+  loopOpen: localStorage.getItem('forge.loopOpen') === '1',
+  switcherOpen: false,
+  assetsSegment: localStorage.getItem('forge.assetsSegment') || 'project',
   account: null,
   intents: [],
   adapters: [],
@@ -420,36 +432,46 @@ function nextTaskStatus(current) {
   return TASK_STATUS_ORDER[idx + 1];
 }
 
+function navItemActive(pageId) {
+  if (pageId === 'project') {
+    return state.page === 'project' || state.page === 'projects';
+  }
+  return state.page === pageId;
+}
+
 function renderNav() {
   const nav = el('nav');
+  const primary = NAV_PRIMARY.map(([id, key]) => (
+    `<button type="button" class="nav-item${navItemActive(id) ? ' active' : ''}" data-page="${id}">${tt(key)}</button>`
+  )).join('');
+  const loopItems = NAV_LOOP.map(([id, key]) => (
+    `<button type="button" class="nav-item${state.page === id ? ' active' : ''}" data-page="${id}">${tt(key)}</button>`
+  )).join('');
   nav.innerHTML = `
-    <div class="scenario-switch" id="scenario-switch">
-      <div class="stat-sub">${tt('scenarioMode')}</div>
-      <div class="btn-row scenario-row">
-        ${SCENARIOS.map((s) => `
-          <button type="button" class="btn ${state.scenarioMode === s ? 'btn-cyan' : 'btn-ghost'} scenario-btn" data-scenario="${s}">
-            ${scenarioLabel(s)}
-          </button>`).join('')}
-      </div>
-      <div class="scenario-workspace-chip">${tt('scenarioWorkspace')} · ${scenarioLabel(state.scenarioMode)}</div>
+    <div class="nav-group" data-group="primary">
+      ${primary}
     </div>
-    ${NAV_GROUPS.map((group) => `
-      <div class="nav-group" data-group="${group.id}">
-        <div class="nav-group-label">${tt(group.labelKey)}</div>
-        ${group.items.map(([id, key]) => (
-          `<button type="button" class="nav-item${state.page === id ? ' active' : ''}" data-page="${id}">${tt(key)}</button>`
-        )).join('')}
-      </div>`).join('')}`;
+    <details class="nav-loop" id="nav-loop" ${state.loopOpen ? 'open' : ''}>
+      <summary class="nav-group-label nav-loop-summary">${tt('navGroupLoop')}</summary>
+      <div class="nav-loop-items">${loopItems}</div>
+    </details>`;
   nav.querySelectorAll('.nav-item').forEach((btn) => {
-    btn.addEventListener('click', () => navigate(btn.dataset.page));
-  });
-  nav.querySelectorAll('[data-scenario]').forEach((btn) => {
     btn.addEventListener('click', () => {
-      state.scenarioMode = btn.dataset.scenario;
-      localStorage.setItem('forge.scenario', state.scenarioMode);
-      renderNav();
-      renderPage();
+      const page = btn.dataset.page;
+      if (page === 'project') {
+        openProject(state.selectedProjectId || WORKBENCH_INTENT_ID, 'validate');
+        return;
+      }
+      if (page === 'projects') {
+        navigate('projects');
+        return;
+      }
+      navigate(page);
     });
+  });
+  el('nav-loop')?.addEventListener('toggle', (e) => {
+    state.loopOpen = e.target.open;
+    localStorage.setItem('forge.loopOpen', state.loopOpen ? '1' : '0');
   });
 }
 
@@ -1296,18 +1318,48 @@ function renderSpaceColumn(title, assets, spaceKey) {
 }
 
 function renderSpaces() {
-  setHeader(tt('navSpaces'), tt('spacesTitle'), tt('spacesSub'));
+  // Legacy alias — assets library is the Space surface (not a task home)
+  renderAssetsLibrary();
+}
+
+function renderAssetsLibrary() {
+  document.body.classList.remove('studio-mode');
+  setHeader('', tt('navAssets'), '');
   const spaces = state.spaces;
+  const seg = state.assetsSegment;
+  const assets = spaces?.[seg] || [];
+  const segments = [
+    ['personal', 'assetsSegmentPersonal'],
+    ['team', 'assetsSegmentTeam'],
+    ['project', 'assetsSegmentProject'],
+  ];
   el('content').innerHTML = `
-    <div class="panel">
-      <p class="empty">${tt('spacesHint')}</p>
-      ${spaces?.note ? `<p class="stat-sub">${escapeAttr(spaces.note)}</p>` : ''}
-    </div>
-    <div class="spaces-grid">
-      ${renderSpaceColumn(tt('spacesPersonal'), spaces?.personal, 'personal')}
-      ${renderSpaceColumn(tt('spacesTeam'), spaces?.team, 'team')}
-      ${renderSpaceColumn(tt('spacesProject'), spaces?.project, 'project')}
+    <div class="assets-library">
+      <div class="assets-segments" role="tablist">
+        ${segments.map(([id, key]) => `
+          <button type="button" class="shell-tab${seg === id ? ' active' : ''}" data-asset-seg="${id}">${tt(key)}</button>
+        `).join('')}
+      </div>
+      <div class="assets-grid">
+        ${assets.length ? assets.map((asset) => `
+          <div class="asset-card">
+            <div class="asset-card-title">${escapeAttr(asset.title)}</div>
+            <div class="stat-sub">
+              <span class="badge">${escapeAttr(asset.kind)}</span>
+              ${(asset.updatedAt || '').slice(0, 10)}
+            </div>
+          </div>`).join('') : `<div class="empty-cta">
+            <button type="button" class="btn btn-cyan" data-deposit="${seg}">${tt('spacesDeposit')}</button>
+          </div>`}
+      </div>
     </div>`;
+  el('content').querySelectorAll('[data-asset-seg]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.assetsSegment = btn.dataset.assetSeg;
+      localStorage.setItem('forge.assetsSegment', state.assetsSegment);
+      renderAssetsLibrary();
+    });
+  });
   el('content').querySelectorAll('[data-deposit]').forEach((btn) => {
     btn.addEventListener('click', () => {
       toast(`${tt('spacesDeposited')} · ${btn.dataset.deposit}`);
@@ -1776,10 +1828,22 @@ function renderAccount() {
       <div class="list-row"><span>${tt('provider')}</span><span>sandbox / stripe-test</span></div>
       <div class="list-row"><span>${tt('credit')}</span><span class="cyan" style="color:var(--cyan)">${state.account?.balance ?? '—'}</span></div>
       <div class="list-row"><span>${tt('staked')}</span><span>${state.account?.staked ?? 0}</span></div>
+      <label class="field" style="margin-top:0.85rem">
+        <span>${tt('scenarioMode')}</span>
+        <select id="account-scenario">
+          ${SCENARIOS.map((s) => `
+            <option value="${s}" ${state.scenarioMode === s ? 'selected' : ''}>${scenarioLabel(s)}</option>
+          `).join('')}
+        </select>
+      </label>
       <div class="btn-row" style="margin-top:0.85rem">
         <button type="button" class="btn btn-primary" id="topup">${tt('topUpBtn')}</button>
       </div>
     </div>`;
+  el('account-scenario')?.addEventListener('change', (e) => {
+    state.scenarioMode = e.target.value;
+    localStorage.setItem('forge.scenario', state.scenarioMode);
+  });
   el('topup').addEventListener('click', async () => {
     try {
       state.account = await api('POST', '/v1/forge/accounts/topup', {
@@ -2173,24 +2237,37 @@ function openProject(projectId, tab = 'validate') {
   localStorage.setItem('forge.projectId', projectId);
   state.selectedIntentId = projectId;
   localStorage.setItem('forge.intent', projectId);
-  setProjectTab(tab);
+  // Switcher always drops into work surface unless caller opts into another tab
+  setProjectTab(tab || 'validate');
   state.page = 'project';
   localStorage.setItem('forge.page', 'project');
-  document.body.classList.toggle('studio-mode', tab === 'validate');
+  state.switcherOpen = false;
+  document.body.classList.toggle('studio-mode', state.projectTab === 'validate');
   applyChromeI18n();
   renderPage();
 }
 
 function projectSwitcherHtml() {
   const current = selectedProject();
+  const recent = state.projects.slice(0, 5);
   return `
     <div class="project-switch">
-      <select id="project-switcher" aria-label="${tt('navProjects')}">
-        ${state.projects.map((p) => `
-          <option value="${escapeAttr(p.id)}" ${p.id === current?.id ? 'selected' : ''}>
-            ${escapeAttr(p.name)}
-          </option>`).join('')}
-      </select>
+      <div class="project-switcher-wrap">
+        <button type="button" class="project-name-btn" id="project-switcher-btn" aria-expanded="${state.switcherOpen ? 'true' : 'false'}" aria-label="${tt('projectSwitcher')}">
+          <span class="project-name-text">${escapeAttr(current?.name || tt('navProjects'))}</span>
+          <span class="project-name-caret" aria-hidden="true">▾</span>
+        </button>
+        ${state.switcherOpen ? `
+          <div class="project-switcher-panel" id="project-switcher-panel" role="listbox">
+            ${recent.map((p) => `
+              <button type="button" class="project-switcher-item${p.id === current?.id ? ' active' : ''}" data-pick-project="${escapeAttr(p.id)}" role="option">
+                ${escapeAttr(p.name)}
+              </button>`).join('')}
+            <button type="button" class="project-switcher-item project-switcher-all" data-all-projects="1">
+              ${tt('projectAll')}
+            </button>
+          </div>` : ''}
+      </div>
       <nav class="shell-tabs" aria-label="${tt('projectTabs')}">
         ${PROJECT_TABS.map(([id, key]) => `
           <button type="button" class="shell-tab${state.projectTab === id ? ' active' : ''}" data-ptab="${id}">
@@ -2201,11 +2278,24 @@ function projectSwitcherHtml() {
 }
 
 function bindProjectChrome() {
-  el('project-switcher')?.addEventListener('change', (e) => {
-    openProject(e.target.value, state.projectTab);
+  el('project-switcher-btn')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    state.switcherOpen = !state.switcherOpen;
+    renderPage();
+  });
+  el('content').querySelectorAll('[data-pick-project]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.switcherOpen = false;
+      openProject(btn.dataset.pickProject, 'validate');
+    });
+  });
+  el('content').querySelector('[data-all-projects]')?.addEventListener('click', () => {
+    state.switcherOpen = false;
+    navigate('projects');
   });
   el('content').querySelectorAll('[data-ptab]').forEach((btn) => {
     btn.addEventListener('click', () => {
+      state.switcherOpen = false;
       setProjectTab(btn.dataset.ptab);
       document.body.classList.toggle('studio-mode', state.projectTab === 'validate');
       renderPage();
@@ -2229,14 +2319,15 @@ function renderProjects() {
     ? state.projects.map((p) => `
       <button type="button" class="project-row" data-open-project="${escapeAttr(p.id)}">
         <span class="project-row-name">${escapeAttr(p.name)}</span>
-        <span class="project-row-meta">${escapeAttr(p.scenario)} · ${escapeAttr(p.status)}</span>
-        <span class="project-row-go">→</span>
+        <span class="badge stage-pill">${escapeAttr(p.status === 'STAKED' ? tt('projectStageActive') : p.status)}</span>
+        <span class="project-row-go">${tt('projectContinue')}</span>
       </button>`).join('')
-    : `<p class="empty">${tt('projectsEmpty')}</p>`;
+    : `<div class="empty-cta"><button type="button" class="btn btn-cyan" id="projects-empty-cta">${tt('projectsEmptyCta')}</button></div>`;
   el('content').innerHTML = `<div class="project-list">${rows}</div>`;
   el('content').querySelectorAll('[data-open-project]').forEach((btn) => {
     btn.addEventListener('click', () => openProject(btn.dataset.openProject, 'validate'));
   });
+  el('projects-empty-cta')?.addEventListener('click', () => openProject(WORKBENCH_INTENT_ID, 'validate'));
 }
 
 function renderMyTasksPage() {
@@ -2259,23 +2350,25 @@ function renderMyTasksPage() {
 function renderProjectOverview() {
   const p = selectedProject();
   const wb = state.projectWorkbench;
-  const budget = wb?.budget;
+  const decision = wb?.accepted
+    ? (wb?.payable ? tt('overviewDecisionPayable') : tt('overviewDecisionActive'))
+    : tt('overviewDecisionOpen');
+  const unknown = wb?.comment?.status === 'open'
+    ? tt('overviewUnknownFeedback')
+    : tt('overviewUnknownNone');
+  const next = wb?.accepted ? tt('overviewNextValidate') : tt('overviewNextAccept');
   el('content').innerHTML = `
     ${projectSwitcherHtml()}
-    <div class="project-panel">
+    <div class="project-panel overview-glance">
       <h2 class="project-heading">${escapeAttr(p?.name || '—')}</h2>
-      <div class="project-meta-row">
-        <span class="badge">${escapeAttr(p?.status || '—')}</span>
-        <span class="stat-sub">${escapeAttr(p?.scenario || '')}</span>
-      </div>
-      ${budget ? `
-        <div class="project-stats">
-          <div><span class="stat-sub">${tt('projectBudget')}</span><strong>¥${budget.total}</strong></div>
-          <div><span class="stat-sub">${tt('projectSpent')}</span><strong>¥${budget.spent}</strong></div>
-          <div><span class="stat-sub">${tt('projectReserved')}</span><strong>¥${budget.reserved}</strong></div>
-        </div>` : ''}
+      <dl class="overview-lines">
+        <div><dt>${tt('overviewDecision')}</dt><dd>${decision}</dd></div>
+        <div><dt>${tt('overviewUnknown')}</dt><dd>${unknown}</dd></div>
+        <div><dt>${tt('overviewNext')}</dt><dd>${next}</dd></div>
+      </dl>
       <div class="btn-row" style="margin-top:1.25rem">
         <button type="button" class="btn btn-cyan" id="goto-validate">${tt('projectTabValidate')}</button>
+        <button type="button" class="btn btn-ghost" id="goto-budget">${tt('overviewBudgetLink')}</button>
       </div>
     </div>`;
   bindProjectChrome();
@@ -2284,6 +2377,7 @@ function renderProjectOverview() {
     document.body.classList.add('studio-mode');
     renderPage();
   });
+  el('goto-budget')?.addEventListener('click', () => navigate('equity'));
 }
 
 function renderProjectEvidence() {
@@ -2441,6 +2535,7 @@ function renderPage() {
     projects: () => { void refreshProjects().then(() => renderProjects()); },
     project: () => { void renderProjectPage(); },
     mytasks: () => { void refreshMyTasks().then(() => renderMyTasksPage()); },
+    assets: () => { void refreshSpaces().then(() => renderAssetsLibrary()); },
     tree: renderTree,
     workbench: renderWorkbench,
     deploy: renderDeploy,
@@ -2460,6 +2555,10 @@ function renderPage() {
   }
   if (state.page === 'mytasks') {
     void refreshMyTasks().then(() => renderMyTasksPage());
+    return;
+  }
+  if (state.page === 'assets') {
+    void refreshSpaces().then(() => renderAssetsLibrary());
     return;
   }
   if (state.page === 'studio') {
