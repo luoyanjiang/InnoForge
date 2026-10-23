@@ -2,9 +2,9 @@ import { t } from './i18n.js';
 import { mountStudioWorkbench, WORKBENCH_INTENT_ID } from './workbench.js';
 
 /**
- * P1.1 shell IA — land on last project validate surface.
- * Project = stage; Space = asset library; scenario off primary nav.
- * Intent OS collapsed under 闭环. No top-level task space.
+ * P1.1 shell IA + plain labels — land on last project Work surface.
+ * Project = stage; Space = file library; scenario off primary nav.
+ * Intent OS collapsed under More. No top-level task space.
  */
 const NAV_PRIMARY = [
   ['project', 'navProjects'],

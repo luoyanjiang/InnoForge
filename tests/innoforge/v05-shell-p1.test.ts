@@ -100,7 +100,7 @@ test('P1 HTTP projects + my-tasks + shell IA markers', async () => {
 
     const i18n = await app.inject({ method: 'GET', url: '/forge/i18n.js' });
     assert.match(i18n.body, /navProjects: '项目'/);
-    assert.match(i18n.body, /navMyTasks: 'My tasks'/);
+    assert.match(i18n.body, /navMyTasks: 'My work'/);
     assert.match(i18n.body, /projectTabEvidence/);
   } finally {
     await app.close();

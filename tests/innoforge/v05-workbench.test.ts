@@ -213,7 +213,7 @@ test('v05 HTTP workbench ensure + studio shell markers', async () => {
     assert.match(js.body, /studio-host|renderProjectValidate|WORKBENCH_INTENT_ID/);
 
     const i18n = await app.inject({ method: 'GET', url: '/forge/i18n.js' });
-    assert.match(i18n.body, /验证工作台|Validation studio|projectTabValidate/);
+    assert.match(i18n.body, /projectTabValidate: '做事'|projectTabValidate: 'Work'|做事/);
 
     const wbJs = await app.inject({ method: 'GET', url: '/forge/workbench.js' });
     assert.equal(wbJs.statusCode, 200);

@@ -35,7 +35,7 @@ test('P1.1 shell IA: land validate, no scenario primary, loop collapsed, assets 
     assert.doesNotMatch(html.body, /baseHint|sessionDemo/);
 
     const i18n = await app.inject({ method: 'GET', url: '/forge/i18n.js' });
-    assert.match(i18n.body, /navAssets: '资产'/);
+    assert.match(i18n.body, /navAssets: '文件'/);
     assert.match(i18n.body, /projectSwitcher/);
     assert.match(i18n.body, /assetsSegmentPersonal/);
     assert.doesNotMatch(i18n.body, /场景工作区 ·/);
